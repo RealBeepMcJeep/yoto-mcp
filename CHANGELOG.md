@@ -1,5 +1,8 @@
 # Changelog
 
+## Optional YouTube source-timeline ranges
+- `add_youtube` accepts optional `start_time`/`end_time` on the original source timeline, validates the selected interval against decoded audio and checks the trimmed MP3's duration. Exact intervals are part of durable job identity, including recovery and duplicate review; old full-source jobs remain compatible. Source, fake-client, real FFmpeg clip and MCP schema tests cover the feature. Deployment and a live Yoto write require a separately verified image and explicit user operation.
+
 ## Guarded empty-chapter removal
 
 - Added `remove_empty_chapter(card_id, chapter_key, expected_title, dry_run=true)`. A write requires `YOTO_ALLOW_WRITES=1` and explicit `dry_run=false`, an exact one-of-one empty chapter, a matching title and no shuffle range spanning the target. Other chapters/tracks remain in order, generated ordinal labels shift when applicable, and a fresh card readback checks the surviving identities, titles, icons, audio hashes and labels. No underlying media or icons are deleted.

@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl, urlsplit
 import httpx
 
 from .metadata import format_track_title
+from .youtube_time import MAX_SOURCE_MS, MIN_CLIP_MS, validate_source_range_ms
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
@@ -66,6 +67,7 @@ DOWNLOAD_TIMEOUT_SECONDS = 180
 MEDIA_PROCESS_TIMEOUT_SECONDS = 180
 MAX_METADATA_OUTPUT_BYTES = 1024 * 1024
 MAX_SOURCE_AUDIO_BYTES = 100 * 1024 * 1024
+MAX_TRIMMED_SOURCE_BYTES = 500 * 1024 * 1024
 MAX_DURATION_SECONDS = 60 * 60
 MAX_CHANNEL_PAGE_BYTES = 2 * 1024 * 1024
 MAX_AVATAR_BYTES = 5 * 1024 * 1024
@@ -300,6 +302,91 @@ def _download_source_audio(
     return resolved
 
 
+def _probe_audio_duration(path: Path, runner: Callable[..., Any]) -> int:
+    """Read the downloaded audio stream's bounded duration from ffprobe."""
+    raw = _run_capture(
+        runner,
+        [
+            _media_binary("ffprobe"), "-v", "error", "-show_entries",
+            "format=duration:stream=codec_name", "-of", "json", str(path),
+        ],
+        timeout=MEDIA_PROCESS_TIMEOUT_SECONDS,
+        output_limit=64 * 1024,
+    )
+    try:
+        probe = json.loads(raw)
+        if not isinstance(probe, dict):
+            raise TypeError
+        media_format = probe.get("format")
+        raw_duration = media_format.get("duration") if isinstance(media_format, dict) else None
+        if isinstance(raw_duration, bool) or not isinstance(raw_duration, (str, int, float)):
+            raise TypeError
+        duration = float(raw_duration)
+        streams = probe.get("streams")
+    except (TypeError, ValueError, OverflowError, json.JSONDecodeError, RecursionError):
+        raise YouTubeSourceError("Downloaded source duration is invalid") from None
+    if (
+        not isinstance(streams, list)
+        or not any(isinstance(stream, dict) and stream.get("codec_name") for stream in streams)
+        or not math.isfinite(duration)
+        or duration <= 0
+        or duration * 1000 > MAX_SOURCE_MS
+    ):
+        raise YouTubeSourceError("Downloaded source duration exceeds the supported range")
+    return round(duration * 1000)
+
+
+def _trim_source_audio(
+    source: Path,
+    stage: Path,
+    start_ms: int | None,
+    end_ms: int | None,
+    runner: Callable[..., Any],
+) -> tuple[Path, int, int, int]:
+    """Create a decoded, lossless clip on the original source timeline."""
+    source_duration_ms = _probe_audio_duration(source, runner)
+    start = start_ms if start_ms is not None else 0
+    end = end_ms if end_ms is not None else source_duration_ms
+    if end > source_duration_ms:
+        raise YouTubeSourceError("Requested source interval exceeds the decoded audio duration")
+    duration = end - start
+    if duration < MIN_CLIP_MS:
+        raise YouTubeSourceError("Requested source clip is shorter than one second")
+    trimmed = stage / "trimmed.flac"
+    args = [
+        _media_binary("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source), "-ss", _format_milliseconds(start), "-t", _format_milliseconds(duration),
+        "-map", "0:a:0", "-vn", "-codec:a", "flac", "-compression_level", "5",
+        "-f", "flac", "-fs", str(MAX_TRIMMED_SOURCE_BYTES), str(trimmed),
+    ]
+    _run_quiet(runner, args, timeout=MEDIA_PROCESS_TIMEOUT_SECONDS)
+    try:
+        if not trimmed.is_file() or trimmed.is_symlink():
+            raise OSError
+        size = trimmed.stat().st_size
+        if size < 128 or size > MAX_TRIMMED_SOURCE_BYTES:
+            raise OSError
+        trimmed.chmod(0o600)
+    except OSError:
+        raise YouTubeSourceError("FFmpeg did not produce a valid bounded source clip") from None
+    decoded_duration_ms = _probe_audio_duration(trimmed, runner)
+    if decoded_duration_ms < MIN_CLIP_MS or abs(decoded_duration_ms - duration) > 50:
+        raise YouTubeSourceError("Decoded source clip duration does not match the requested interval")
+    _run_quiet(
+        runner,
+        [
+            _media_binary("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-i", str(trimmed), "-map", "0:a:0", "-f", "null", "-",
+        ],
+        timeout=MEDIA_PROCESS_TIMEOUT_SECONDS,
+    )
+    return trimmed, start, end, decoded_duration_ms
+
+
+def _format_milliseconds(value: int) -> str:
+    return f"{value // 1000}.{value % 1000:03d}"
+
+
 def _text_field(value: Any, *, limit: int = 300) -> str:
     if not isinstance(value, str):
         return ""
@@ -368,7 +455,12 @@ def _encode_mp3(
         raise YouTubeSourceError("FFmpeg did not produce a valid bounded MP3") from None
 
 
-def _verify_mp3(path: Path, runner: Callable[..., Any]) -> None:
+def _verify_mp3(
+    path: Path,
+    runner: Callable[..., Any],
+    *,
+    expected_duration_ms: int | None = None,
+) -> None:
     probe_args = [
         _media_binary("ffprobe"),
         "-v",
@@ -394,6 +486,11 @@ def _verify_mp3(path: Path, runner: Callable[..., Any]) -> None:
         raise YouTubeSourceError("Extracted audio is not a valid MP3")
     if duration <= 0 or duration > MAX_DURATION_SECONDS:
         raise YouTubeSourceError("Extracted MP3 duration is outside the supported range")
+    if expected_duration_ms is not None and (
+        duration * 1000 < MIN_CLIP_MS
+        or abs(round(duration * 1000) - expected_duration_ms) > 250
+    ):
+        raise YouTubeSourceError("Encoded MP3 duration does not match the requested source clip")
 
     loudness_args = [
         _media_binary("ffmpeg"),
@@ -813,12 +910,19 @@ def prepare_youtube(
     *,
     artist: str | None = None,
     song_name: str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
     runner: Callable[..., Any] = subprocess.run,
     transport: httpx.BaseTransport | None = None,
 ) -> dict[str, Any]:
     """Prepare a bounded local MP3 and verified public-source metadata."""
     if not isinstance(video_id, str) or not _VIDEO_ID_RE.fullmatch(video_id):
         raise YouTubeSourceError("A canonical YouTube video ID is required")
+    try:
+        start_ms, end_ms = validate_source_range_ms(start_ms, end_ms)
+    except ValueError as exc:
+        raise YouTubeSourceError(str(exc)) from None
+    ranged = start_ms is not None or end_ms is not None
     if (artist is None) != (song_name is None):
         raise ValueError("artist and song_name must be provided together")
     override_artist: str | None = None
@@ -861,6 +965,19 @@ def prepare_youtube(
         warnings.append("AcoustID lookup unavailable: no API key configured")
     stage = _make_staging_directory(upload_root, video_id)
     source_audio = _download_source_audio(video_id, stage, runner)
+    source_interval = None
+    effective_duration_ms: int | None = None
+    if ranged:
+        downloaded_audio = source_audio
+        source_audio, actual_start_ms, actual_end_ms, effective_duration_ms = (
+            _trim_source_audio(downloaded_audio, stage, start_ms, end_ms, runner)
+        )
+        downloaded_audio.unlink()
+        source_interval = {
+            "start_ms": actual_start_ms,
+            "end_ms": actual_end_ms,
+            "effective_duration_ms": effective_duration_ms,
+        }
     mp3_path = stage / "audio.mp3"
     client = httpx.Client(
         transport=transport,
@@ -900,14 +1017,21 @@ def prepare_youtube(
                             )
             _encode_mp3(source_audio, mp3_path, artist, title, album, runner)
             source_audio.unlink()
-            _verify_mp3(mp3_path, runner)
+            if ranged:
+                assert source_interval is not None
+                _verify_mp3(
+                    mp3_path, runner,
+                    expected_duration_ms=source_interval["end_ms"] - source_interval["start_ms"],
+                )
+            else:
+                _verify_mp3(mp3_path, runner)
             try:
                 avatar_path = _download_avatar(client, stage, channel_id, channel_name)
             except YouTubeSourceError:
                 warnings.append("Channel avatar unavailable or could not be verified")
     finally:
         client.close()
-    return {
+    result = {
         "video_id": video_id,
         "source_title": source_title,
         "channel_id": channel_id,
@@ -923,3 +1047,6 @@ def prepare_youtube(
         "avatar_path": str(avatar_path) if avatar_path else None,
         "requires_review": requires_review,
     }
+    if source_interval is not None:
+        result["source_interval"] = source_interval
+    return result

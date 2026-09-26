@@ -650,3 +650,168 @@ def test_source_rejects_video_longer_than_yoto_limit_before_download(tmp_path: P
         prepare_youtube("abcdefghijk", tmp_path, runner=runner)
 
     assert len(calls) == 1
+
+
+def test_ranged_source_is_trimmed_before_fingerprinting_and_mp3_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("ACOUSTID_API_KEY", raising=False)
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        if "--dump-single-json" in args:
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps({
+                "id": "abcdefghijk", "title": "Artist - Song", "channel": "Test Channel",
+                "channel_id": CHANNEL_ID,
+            }), stderr="")
+        if "--format" in args:
+            template = Path(args[args.index("--output") + 1])
+            Path(str(template).replace("%(ext)s", "m4a")).write_bytes(b"s" * 256)
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if Path(args[0]).name == "ffprobe":
+            path = Path(args[-1])
+            duration, codec = (
+                (120, "aac") if path.suffix == ".m4a"
+                else (10, "flac") if path.suffix == ".flac"
+                else (10.026, "mp3")
+            )
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps({
+                "streams": [{"codec_name": codec}], "format": {"duration": str(duration)},
+            }), stderr="")
+        if Path(args[0]).name == "ffmpeg" and "flac" in args:
+            Path(args[-1]).write_bytes(b"f" * 256)
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if Path(args[0]).name == "ffmpeg" and "chromaprint" in args:
+            return subprocess.CompletedProcess(args, 0, stdout="FINGERPRINT-FIXTURE", stderr="")
+        if Path(args[0]).name == "ffmpeg" and "libmp3lame" in args:
+            Path(args[-1]).write_bytes(b"m" * 256)
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if Path(args[0]).name == "ffmpeg" and "volumedetect" in args:
+            return subprocess.CompletedProcess(
+                args, 0, stdout="", stderr="mean_volume: -20.0 dB\nmax_volume: -1.0 dB",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    result = prepare_youtube(
+        "abcdefghijk", tmp_path, acoustid_key="test-key", start_ms=20_000, end_ms=30_000,
+        runner=runner, transport=_fingerprint_transport([]),
+    )
+
+    trim_index = next(i for i, args in enumerate(calls) if "flac" in args)
+    fingerprint_index = next(i for i, args in enumerate(calls) if "chromaprint" in args)
+    encode_index = next(i for i, args in enumerate(calls) if "libmp3lame" in args)
+    trim_args = calls[trim_index]
+    assert trim_index < fingerprint_index < encode_index
+    assert trim_args[trim_args.index("-ss") + 1] == "20.000"
+    assert trim_args[trim_args.index("-t") + 1] == "10.000"
+    assert result["source_interval"] == {
+        "start_ms": 20_000, "end_ms": 30_000, "effective_duration_ms": 10_000,
+    }
+    assert Path(result["mp3_path"]).is_file()
+    stage = Path(result["mp3_path"]).parent
+    assert not list(stage.glob("source.*"))
+    assert not (stage / "trimmed.flac").exists()
+
+
+def test_requested_end_is_checked_against_downloaded_audio_duration(tmp_path: Path):
+    from yoto_mcp import youtube_source as source
+
+    source_audio = tmp_path / "source.m4a"
+    source_audio.write_bytes(b"s" * 256)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps({
+            "streams": [{"codec_name": "aac"}], "format": {"duration": "10.0"},
+        }), stderr="")
+
+    with pytest.raises(YouTubeSourceError, match="decoded audio duration"):
+        source._trim_source_audio(source_audio, stage, 0, 10_001, runner)
+
+    assert len(calls) == 1
+    assert not (stage / "trimmed.flac").exists()
+
+
+def test_trim_rejects_a_clip_half_a_second_short_of_requested_interval(tmp_path: Path):
+    from yoto_mcp import youtube_source as source
+
+    original = tmp_path / "source.m4a"
+    original.write_bytes(b"s" * 256)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+
+    def runner(args, **kwargs):
+        if Path(args[0]).name == "ffprobe":
+            is_trimmed = Path(args[-1]).suffix == ".flac"
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps({
+                "streams": [{"codec_name": "flac" if is_trimmed else "aac"}],
+                "format": {"duration": "9.5" if is_trimmed else "120.0"},
+            }), stderr="")
+        if Path(args[0]).name == "ffmpeg" and "flac" in args:
+            Path(args[-1]).write_bytes(b"f" * 256)
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if Path(args[0]).name == "ffmpeg" and "null" in args:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError("unexpected subprocess after a short decoded clip")
+
+    with pytest.raises(YouTubeSourceError, match="does not match the requested interval"):
+        source._trim_source_audio(original, stage, 20_000, 30_000, runner)
+
+
+def test_encoded_mp3_is_checked_against_requested_duration_not_a_short_clip(tmp_path: Path):
+    from yoto_mcp import youtube_source as source
+
+    mp3 = tmp_path / "clip.mp3"
+
+    def runner(args, **kwargs):
+        if Path(args[0]).name == "ffprobe":
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps({
+                "streams": [{"codec_name": "mp3"}], "format": {"duration": "9.6"},
+            }), stderr="")
+        if Path(args[0]).name == "ffmpeg" and "volumedetect" in args:
+            return subprocess.CompletedProcess(
+                args, 0, stdout="", stderr="mean_volume: -20.0 dB\nmax_volume: -1.0 dB",
+            )
+        raise AssertionError("unexpected subprocess after a short encoded clip")
+
+    with pytest.raises(YouTubeSourceError, match="does not match the requested source clip"):
+        source._verify_mp3(mp3, runner, expected_duration_ms=10_000)
+
+
+@pytest.mark.skipif(
+    not Path("/usr/bin/ffmpeg").is_file() or not Path("/usr/bin/ffprobe").is_file(),
+    reason="real FFmpeg/ffprobe integration binaries are unavailable",
+)
+def test_real_ffmpeg_decodes_and_validates_a_one_second_source_clip(tmp_path: Path):
+    from yoto_mcp import youtube_source as source
+
+    original = tmp_path / "source.wav"
+    generated = subprocess.run(
+        [
+            "/usr/bin/ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=5", "-ac", "2",
+            "-c:a", "pcm_s16le", str(original),
+        ],
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert generated.returncode == 0
+
+    stage = tmp_path / "stage"
+    stage.mkdir(mode=0o700)
+    clipped, actual_start, actual_end, duration_ms = source._trim_source_audio(
+        original, stage, 1500, 2500, subprocess.run,
+    )
+    mp3 = stage / "clip.mp3"
+    source._encode_mp3(clipped, mp3, "Test Artist", "Short Clip", "", subprocess.run)
+    source._verify_mp3(mp3, subprocess.run, expected_duration_ms=duration_ms)
+
+    assert clipped.is_file()
+    assert (actual_start, actual_end, duration_ms) == (1500, 2500, 1000)
+    assert mp3.stat().st_size >= 128
+    assert original.is_file()

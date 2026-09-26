@@ -276,8 +276,11 @@ def test_add_youtube_tool_accepts_explicit_credits_and_returns_job_status(tmp_pa
     seen = []
 
     class FakeYouTube:
-        def submit(self, card_id, video_id, *, dry_run=True, artist=None, song_name=None):
-            seen.append((card_id, video_id, dry_run, artist, song_name))
+        def submit(
+            self, card_id, video_id, *, dry_run=True, artist=None, song_name=None,
+            start_time=None, end_time=None,
+        ):
+            seen.append((card_id, video_id, dry_run, artist, song_name, start_time, end_time))
             return {"job_id": "job-one", "status": "queued"}
 
         def get(self, job_id):
@@ -289,9 +292,20 @@ def test_add_youtube_tool_accepts_explicit_credits_and_returns_job_status(tmp_pa
         settings, client_factory=lambda _: RecordingClient(),
         youtube_factory=lambda _client, _settings: FakeYouTube(),
     )
+    tools = asyncio.run(server.list_tools())
+    youtube_tool = next(tool for tool in tools if tool.name == "add_youtube")
+    assert {entry.get("type") for entry in youtube_tool.input_schema["properties"]["start_time"]["anyOf"]} == {
+        "string", "null",
+    }
+    assert {entry.get("type") for entry in youtube_tool.input_schema["properties"]["end_time"]["anyOf"]} == {
+        "string", "null",
+    }
+    assert "start_time" not in youtube_tool.input_schema["required"]
+    assert "end_time" not in youtube_tool.input_schema["required"]
     submitted = asyncio.run(server.call_tool("add_youtube", {
         "card_id": "card-one", "video_id": "abcdefghijk",
         "artist": "Chosen Artist", "song_name": "Chosen Song",
+        "start_time": "1:38", "end_time": "3:00",
     }))
     result = asyncio.run(server.call_tool("get_youtube_job", {"job_id": "job-one"}))
     assert submitted.structured_content == {"job_id": "job-one", "status": "queued"}
@@ -299,7 +313,7 @@ def test_add_youtube_tool_accepts_explicit_credits_and_returns_job_status(tmp_pa
         "job_id": "job-one", "status": "complete", "stage": "preview",
     }
     assert seen == [
-        ("card-one", "abcdefghijk", True, "Chosen Artist", "Chosen Song"),
+        ("card-one", "abcdefghijk", True, "Chosen Artist", "Chosen Song", "1:38", "3:00"),
         ("get", "job-one"),
     ]
 

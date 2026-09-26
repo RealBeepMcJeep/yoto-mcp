@@ -20,10 +20,19 @@ async def smoke() -> None:
         hello = await session.initialize()
         tools = await session.list_tools()
         tool_names = {item.name for item in tools.tools}
-        if hello.server_info.name != "yoto-mcp" or not {
-            "add_youtube", "remove_empty_chapter",
-        } <= tool_names:
+        youtube_tool = next((item for item in tools.tools if item.name == "add_youtube"), None)
+        if (
+            hello.server_info.name != "yoto-mcp"
+            or youtube_tool is None
+            or not {"remove_empty_chapter"} <= tool_names
+        ):
             raise RuntimeError("Default stdio MCP handshake returned unexpected tools")
+        properties = youtube_tool.input_schema.get("properties", {})
+        required = set(youtube_tool.input_schema.get("required", []))
+        if not {"start_time", "end_time"} <= properties.keys() or {
+            "start_time", "end_time",
+        } & required:
+            raise RuntimeError("add_youtube schema lacks optional source-timeline timestamps")
         print(f"Stdio smoke passed: {len(tools.tools)} tools, {hello.protocol_version}")
 
 

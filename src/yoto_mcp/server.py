@@ -120,15 +120,24 @@ def create_server(
     def get_playlist(card_id: str) -> dict[str, Any]:
         return client.get_playlist(card_id)
 
-    @server.tool(name="add_youtube", description="Start a durable background YouTube-to-Yoto job. Defaults to a private download/metadata/avatar preview without Yoto writes; provide dry_run=false for an authorized upload.")
+    @server.tool(
+        name="add_youtube",
+        description=(
+            "Start a durable background YouTube-to-Yoto job. Defaults to a private download/metadata/avatar "
+            "preview without Yoto writes; provide dry_run=false for an authorized upload. Optional "
+            "start_time/end_time select the original source timeline using M:SS[.mmm] or HH:MM:SS[.mmm]."
+        ),
+    )
     def add_youtube(
         card_id: str, video_id: str, dry_run: bool = True,
         artist: str | None = None, song_name: str | None = None,
+        start_time: str | None = None, end_time: str | None = None,
     ) -> dict[str, Any]:
         if youtube is None:
             raise ValueError("YOTO_UPLOAD_ROOT and YOTO_JOB_ROOT must be configured")
         return youtube.submit(
             card_id, video_id, dry_run=dry_run, artist=artist, song_name=song_name,
+            start_time=start_time, end_time=end_time,
         )
 
     @server.tool(name="get_youtube_job", description="Read persisted YouTube job progress, warnings, status, and safe upload-failure diagnostics by job ID.")

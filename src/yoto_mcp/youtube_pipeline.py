@@ -52,6 +52,7 @@ class YouTubeCoordinator:
     def submit(
         self, card_id: str, video_id: str, *, dry_run: bool = True,
         artist: str | None = None, song_name: str | None = None,
+        start_time: str | None = None, end_time: str | None = None,
     ) -> dict[str, Any]:
         if not dry_run and not self.allow_writes:
             raise ValueError("YOTO_ALLOW_WRITES=1 is required for a YouTube write job")
@@ -59,6 +60,7 @@ class YouTubeCoordinator:
         with self._lock:
             job = self.store.submit(
                 card_id, video_id, dry_run, artist=artist, song_name=song_name,
+                start_time=start_time, end_time=end_time,
             )
             if job["status"] == "queued" and job["job_id"] not in self._futures:
                 self._futures[job["job_id"]] = self._pool.submit(self._run, job)
@@ -237,17 +239,25 @@ class YouTubeCoordinator:
         job_id = job["job_id"]
         try:
             self.store.update(job_id, status="running", stage="source")
+            prepare_kwargs: dict[str, Any] = {
+                "artist": job.get("artist"), "song_name": job.get("song_name"),
+            }
+            if job.get("start_ms") is not None or job.get("end_ms") is not None:
+                prepare_kwargs.update(start_ms=job.get("start_ms"), end_ms=job.get("end_ms"))
             prepared = self.prepare(
-                job["video_id"], self.upload_root,
-                artist=job.get("artist"), song_name=job.get("song_name"),
+                job["video_id"], self.upload_root, **prepare_kwargs,
             )
+            metadata_fields = [
+                "source_title", "channel_id", "channel_name", "artist", "title",
+                "album", "title_label", "metadata_source", "metadata_score",
+            ]
+            metadata = {field: prepared.get(field) for field in metadata_fields}
+            if job.get("start_ms") is not None or job.get("end_ms") is not None:
+                metadata["source_interval"] = prepared.get("source_interval") or {
+                    "start_ms": job.get("start_ms"), "end_ms": job.get("end_ms"),
+                }
             fields = {
-                "metadata": {
-                    field: prepared.get(field) for field in (
-                        "source_title", "channel_id", "channel_name", "artist", "title",
-                        "album", "title_label", "metadata_source", "metadata_score",
-                    )
-                },
+                "metadata": metadata,
                 "warnings": prepared.get("warnings", []),
                 "mp3_path": prepared.get("mp3_path"),
                 "avatar_path": prepared.get("avatar_path"),
@@ -355,17 +365,38 @@ class YouTubeCoordinator:
 
     def _duplicate_sources(
         self, job: dict[str, Any], label: str, card: dict[str, Any],
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
         normalized = self._normal_label(label)
-        other_videos = sorted({
-            other["video_id"] for other in self.store.all_jobs()
+        other_jobs = [
+            other for other in self.store.all_jobs()
             if other["card_id"] == job["card_id"]
-            and other["video_id"] != job["video_id"]
             and not other["dry_run"]
+            and other["job_id"] != job["job_id"]
+            and (
+                other["video_id"] != job["video_id"]
+                or (other.get("start_ms"), other.get("end_ms"))
+                != (job.get("start_ms"), job.get("end_ms"))
+            )
             and isinstance(other.get("metadata"), dict)
             and isinstance(other["metadata"].get("title_label"), str)
             and self._normal_label(other["metadata"]["title_label"]) == normalized
-        })
+        ]
+        other_videos = sorted({other["video_id"] for other in other_jobs})
+        other_intervals = [
+            {
+                "video_id": other["video_id"],
+                "start_ms": other.get("start_ms"),
+                "end_ms": other.get("end_ms"),
+            }
+            for other in other_jobs
+        ]
+        other_intervals.sort(
+            key=lambda item: (
+                item["video_id"],
+                -1 if item["start_ms"] is None else item["start_ms"],
+                -1 if item["end_ms"] is None else item["end_ms"],
+            )
+        )
         chapters = card.get("content", {}).get("chapters", [])
         existing_tracks = sorted({
             track["key"] for chapter in chapters if isinstance(chapter, dict)
@@ -374,7 +405,7 @@ class YouTubeCoordinator:
             and self._normal_label(track["title"]) == normalized
             and isinstance(track.get("key"), str)
         })
-        return other_videos, existing_tracks
+        return other_videos, other_intervals, existing_tracks
 
     def _publish(
         self, job_id: str, job: dict[str, Any], prepared: dict[str, Any],
@@ -400,17 +431,19 @@ class YouTubeCoordinator:
             card_lock = self._card_locks.setdefault(job["card_id"], Lock())
         with card_lock:
             card = self.client.get_playlist(job["card_id"])
-            other_videos, existing_tracks = self._duplicate_sources(
+            other_videos, other_intervals, existing_tracks = self._duplicate_sources(
                 job, prepared["title_label"], card,
             )
             review_changed = bool(job.get("duplicate_approved")) and (
                 other_videos != job.get("duplicate_sources", [])
+                or other_intervals != job.get("duplicate_source_intervals", [])
                 or existing_tracks != job.get("duplicate_existing_track_keys", [])
             )
             if review_changed or ((other_videos or existing_tracks) and not job.get("duplicate_approved")):
                 self.store.update(
                     job_id, **fields, status="needs_duplicate_review", stage="duplicate_review",
                     resume_from="duplicate", duplicate_sources=other_videos,
+                    duplicate_source_intervals=other_intervals,
                     duplicate_existing_track_keys=existing_tracks, duplicate_approved=False,
                     write_intent=None,
                 )

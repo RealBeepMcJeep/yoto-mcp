@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .youtube_time import parse_source_range, validate_source_range_ms
+
 _JOB_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 _CARD_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}\Z")
@@ -35,6 +37,7 @@ _MUTABLE_FIELDS = frozenset(
         "warnings",
         "metadata",
         "duplicate_sources",
+        "duplicate_source_intervals",
         "duplicate_existing_track_keys",
         "duplicate_approved",
         "mp3_path",
@@ -58,10 +61,11 @@ class JobStoreError(RuntimeError):
 class JobStore:
     """Atomic, mode-restricted JSON job journal rooted outside the source tree.
 
-    ``submit(card_id, video_id, dry_run)`` returns the durable job dictionary;
-    the exact ``(card_id, video_id, dry_run)`` tuple is idempotent. ``get``
-    reads by job ID, ``update(job_id, **fields)`` atomically replaces mutable
-    fields, and ``recoverable_jobs()`` returns unfinished jobs in creation order.
+    ``submit(card_id, video_id, dry_run, start_time, end_time)`` returns the
+    durable job dictionary; its ``(card_id, video_id, dry_run, start_ms, end_ms)``
+    identity is canonical and range-sensitive. ``get`` reads by job ID, ``update(job_id, **fields)``
+    atomically replaces mutable fields, and ``recoverable_jobs()`` returns
+    unfinished jobs in creation order.
     """
 
     def __init__(self, root: str | Path) -> None:
@@ -79,12 +83,14 @@ class JobStore:
     def submit(
         self, card_id: str, video_id: str, dry_run: bool,
         *, artist: str | None = None, song_name: str | None = None,
+        start_time: str | None = None, end_time: str | None = None,
     ) -> dict[str, Any]:
-        """Admit or return the job for an exact card/video/mode tuple."""
+        """Admit or return the job for an exact card/video/mode/source interval."""
         card_id = self._validate_identifier(card_id, _CARD_ID_RE, "card_id")
         video_id = self._validate_identifier(video_id, _VIDEO_ID_RE, "video_id")
         if not isinstance(dry_run, bool):
             raise TypeError("dry_run must be a bool")
+        start_ms, end_ms = parse_source_range(start_time, end_time)
         if (artist is None) != (song_name is None):
             raise ValueError("artist and song_name must be provided together")
         if artist is not None and song_name is not None:
@@ -105,6 +111,7 @@ class JobStore:
                     existing["card_id"] == card_id
                     and existing["video_id"] == video_id
                     and existing["dry_run"] is dry_run
+                    and (existing.get("start_ms"), existing.get("end_ms")) == (start_ms, end_ms)
                 ):
                     if (existing.get("artist"), existing.get("song_name")) != (artist, song_name):
                         raise ValueError("Existing job has different artist/song_name overrides")
@@ -118,6 +125,8 @@ class JobStore:
                 "dry_run": dry_run,
                 "artist": artist,
                 "song_name": song_name,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
                 "stage": "queued",
                 "status": "queued",
                 "resume_from": "source",
@@ -331,6 +340,10 @@ class JobStore:
             ))
         ):
             raise JobStoreError("A job record does not match the expected schema")
+        try:
+            validate_source_range_ms(job.get("start_ms"), job.get("end_ms"))
+        except ValueError:
+            raise JobStoreError("A job record has an invalid source interval") from None
 
     @staticmethod
     def _now() -> str:

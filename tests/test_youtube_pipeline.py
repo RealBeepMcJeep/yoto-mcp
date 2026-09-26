@@ -918,3 +918,153 @@ def test_guarded_resume_persists_existing_yoto_audio_source_only_after_readback(
     assert client.add_calls == 2
     assert len(client.card["content"]["chapters"]) == 1
     resumed.close()
+
+
+def test_source_interval_is_admitted_persisted_and_forwarded_to_preview(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    prepared_calls = []
+
+    def prepare(video_id, upload_root, **kwargs):
+        prepared_calls.append((video_id, kwargs))
+        mp3 = upload_root / "clip.mp3"
+        avatar = upload_root / "avatar.jpg"
+        mp3.write_bytes(b"mp3")
+        avatar.write_bytes(b"jpg")
+        return {
+            "title_label": "Artist — Song", "warnings": [],
+            "mp3_path": str(mp3), "avatar_path": str(avatar),
+            "source_interval": {
+                "start_ms": kwargs["start_ms"], "end_ms": 30_000,
+                "effective_duration_ms": 10_000,
+            },
+        }
+
+    coordinator = YouTubeCoordinator(
+        NoYotoWrites(), store, root, allow_writes=False, prepare=prepare,
+    )
+    queued = coordinator.submit(
+        "card-one", "abcdefghijk", start_time="0:20", end_time="0:30",
+    )
+    completed = coordinator.wait(queued["job_id"], timeout=3)
+
+    assert (queued["start_ms"], queued["end_ms"]) == (20_000, 30_000)
+    assert prepared_calls == [("abcdefghijk", {
+        "artist": None, "song_name": None, "start_ms": 20_000, "end_ms": 30_000,
+    })]
+    assert completed["metadata"]["source_interval"] == {
+        "start_ms": 20_000, "end_ms": 30_000, "effective_duration_ms": 10_000,
+    }
+    assert coordinator.get(queued["job_id"])["start_ms"] == 20_000
+    coordinator.close()
+
+
+def test_invalid_range_is_rejected_before_coordinator_admission(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    coordinator = YouTubeCoordinator(
+        NoYotoWrites(), store, root, allow_writes=False,
+        prepare=lambda *_args, **_kwargs: pytest.fail("invalid range must not start source work"),
+    )
+
+    with pytest.raises(ValueError, match="timestamp|range|time"):
+        coordinator.submit("card-one", "abcdefghijk", start_time="62")
+
+    assert store.all_jobs() == []
+    coordinator.close()
+
+
+def test_source_only_resume_reuses_the_persisted_source_interval(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    interrupted = store.submit(
+        "card-one", "abcdefghijk", dry_run=True,
+        start_time="0:20", end_time="0:40",
+    )
+    store.update(interrupted["job_id"], status="running", stage="source")
+    prepare_calls = []
+
+    def prepare(video_id, _root, **kwargs):
+        prepare_calls.append((video_id, kwargs))
+        return {"title_label": "Artist — Song", "warnings": []}
+
+    coordinator = YouTubeCoordinator(
+        NoYotoWrites(), JobStore(tmp_path / "private-jobs"), root,
+        allow_writes=False, prepare=prepare,
+    )
+    coordinator.resume(interrupted["job_id"])
+    completed = coordinator.wait(interrupted["job_id"], timeout=3)
+
+    assert completed["status"] == "complete"
+    assert prepare_calls == [("abcdefghijk", {
+        "artist": None, "song_name": None, "start_ms": 20_000, "end_ms": 40_000,
+    })]
+    assert completed["metadata"]["source_interval"] == {
+        "start_ms": 20_000, "end_ms": 40_000,
+    }
+    coordinator.close()
+
+
+def test_same_label_from_another_interval_of_same_video_requires_duplicate_review(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    previous = store.submit(
+        "card-one", "abcdefghijk", dry_run=False,
+        start_time="0:20", end_time="0:30",
+    )
+    store.update(
+        previous["job_id"], status="complete", stage="complete",
+        metadata={"title_label": "Artist — Song"},
+    )
+    prepare_calls = []
+    add_calls = []
+
+    class NoUploadClient:
+        def get_playlist(self, _card_id):
+            return {"content": {"chapters": []}}
+
+        def add_mp3(self, *_args, **_kwargs):
+            add_calls.append(_args)
+            raise RuntimeError("fake Yoto upload deliberately stopped")
+
+    def prepare(_video_id, upload_root, **kwargs):
+        prepare_calls.append((kwargs["start_ms"], kwargs["end_ms"]))
+        mp3, avatar = upload_root / "song.mp3", upload_root / "avatar.jpg"
+        mp3.write_bytes(b"mp3")
+        avatar.write_bytes(b"jpg")
+        return {
+            "title_label": "Artist — Song", "warnings": [],
+            "mp3_path": str(mp3), "avatar_path": str(avatar),
+            "source_interval": {
+                "start_ms": kwargs["start_ms"], "end_ms": kwargs["end_ms"],
+                "effective_duration_ms": 10_000,
+            },
+        }
+
+    coordinator = YouTubeCoordinator(
+        NoUploadClient(), store, root, allow_writes=True, prepare=prepare,
+    )
+    queued = coordinator.submit(
+        "card-one", "abcdefghijk", dry_run=False,
+        start_time="0:40", end_time="0:50",
+    )
+    flagged = coordinator.wait(queued["job_id"], timeout=3)
+
+    assert flagged["status"] == "needs_duplicate_review"
+    assert flagged["duplicate_sources"] == ["abcdefghijk"]
+    assert flagged["duplicate_source_intervals"] == [{
+        "video_id": "abcdefghijk", "start_ms": 20_000, "end_ms": 30_000,
+    }]
+    assert flagged["start_ms"] == 40_000
+    assert flagged["metadata"]["source_interval"]["start_ms"] == 40_000
+    coordinator.resume(queued["job_id"], approve_duplicate=True)
+    resumed = coordinator.wait(queued["job_id"], timeout=3)
+    assert prepare_calls == [(40_000, 50_000)]
+    assert len(add_calls) == 1
+    assert resumed["start_ms"] == 40_000 and resumed["end_ms"] == 50_000
+    assert resumed["metadata"]["source_interval"]["start_ms"] == 40_000
+    coordinator.close()

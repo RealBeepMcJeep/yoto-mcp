@@ -80,6 +80,88 @@ def test_submit_is_idempotent_per_card_video_and_dry_run_mode(tmp_path):
     assert write_job["dry_run"] is False
     assert len(store.recoverable_jobs()) == 4
 
+
+def test_source_ranges_are_canonical_and_part_of_job_identity(tmp_path):
+    store = JobStore(tmp_path / "private-jobs")
+
+    first = store.submit(
+        "card-one", "abcdefghijk", dry_run=True,
+        start_time="1:02.125", end_time="1:04",
+    )
+    same_range = store.submit(
+        "card-one", "abcdefghijk", dry_run=True,
+        start_time="00:01:02.125", end_time="00:01:04",
+    )
+    different_range = store.submit(
+        "card-one", "abcdefghijk", dry_run=True,
+        start_time="1:03", end_time="1:04",
+    )
+    full_source = store.submit("card-one", "abcdefghijk", dry_run=True)
+
+    assert first["start_ms"] == 62_125
+    assert first["end_ms"] == 64_000
+    assert same_range["job_id"] == first["job_id"]
+    assert different_range["job_id"] != first["job_id"]
+    assert full_source["job_id"] not in {first["job_id"], different_range["job_id"]}
+
+
+def test_legacy_job_without_range_fields_remains_full_source_and_idempotent(tmp_path):
+    root = tmp_path / "private-jobs"
+    store = JobStore(root)
+    original = store.submit("card-one", "abcdefghijk", dry_run=True)
+    path = root / f"{original['job_id']}.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record.pop("start_ms", None)
+    record.pop("end_ms", None)
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    loaded = JobStore(root).get(original["job_id"])
+    same_full_source = JobStore(root).submit("card-one", "abcdefghijk", dry_run=True)
+
+    assert loaded.get("start_ms") is None
+    assert loaded.get("end_ms") is None
+    assert same_full_source["job_id"] == original["job_id"]
+
+
+def test_source_range_accepts_the_exact_one_hour_boundary(tmp_path):
+    store = JobStore(tmp_path / "private-jobs")
+
+    job = store.submit(
+        "card-one", "abcdefghijk", dry_run=True, end_time="01:00:00.000",
+    )
+
+    assert job["start_ms"] is None
+    assert job["end_ms"] == 3_600_000
+
+
+@pytest.mark.parametrize(
+    "start_time,end_time",
+    [
+        ("62", "1:04"),
+        ("-1:00", "1:04"),
+        ("1:04.0001", "1:05"),
+        ("NaN", "1:04"),
+        ("1:04", "Infinity"),
+        ("1:04", "1:04"),
+        ("1:05", "1:04"),
+        (None, "0:00.999"),
+        ("59:59.001", None),
+        (None, "01:00:00.001"),
+        (None, "1:00:01"),
+        ("1:00:00", "1:00:01"),
+    ],
+)
+def test_invalid_source_ranges_are_rejected_before_job_admission(tmp_path, start_time, end_time):
+    store = JobStore(tmp_path / "private-jobs")
+
+    with pytest.raises(ValueError, match="time|range|duration|timestamp|clip|second|one-hour"):
+        store.submit(
+            "card-one", "abcdefghijk", dry_run=True,
+            start_time=start_time, end_time=end_time,
+        )
+
+    assert store.all_jobs() == []
+
 def test_explicit_credits_are_persisted_and_idempotent_across_restart(tmp_path):
     root = tmp_path / "private-jobs"
     store = JobStore(root)
