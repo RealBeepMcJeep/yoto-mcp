@@ -34,6 +34,10 @@ class RecordingClient:
         self.calls.append(("remove_track", card_id, track_key, dry_run))
         return {"dry_run": dry_run}
 
+    def remove_empty_chapter(self, card_id, chapter_key, expected_title, *, dry_run=True):
+        self.calls.append(("remove_empty_chapter", card_id, chapter_key, expected_title, dry_run))
+        return {"dry_run": dry_run}
+
     def upload_icon(self, file_path, *, auto_convert=True, filename=None, dry_run=True):
         self.calls.append(("upload_icon", file_path, auto_convert, filename, dry_run))
         return {"dry_run": dry_run}
@@ -70,6 +74,7 @@ def test_server_registers_list_read_add_remove_tools_and_defaults_mutations_to_d
         "add_mp3",
         "rename_track",
         "remove_track",
+        "remove_empty_chapter",
         "inspect_mp3_metadata",
         "lookup_recordings",
         "upload_icon",
@@ -81,6 +86,9 @@ def test_server_registers_list_read_add_remove_tools_and_defaults_mutations_to_d
         "resume_youtube_job",
     }
     assert received_settings == [settings]
+    chapter_tool = next(tool for tool in tools if tool.name == "remove_empty_chapter")
+    assert chapter_tool.input_schema["required"] == ["card_id", "chapter_key", "expected_title"]
+    assert chapter_tool.input_schema["properties"]["dry_run"]["default"] is True
     asyncio.run(server.call_tool("list_playlists", {}))
     asyncio.run(server.call_tool("get_playlist", {"card_id": "card-1"}))
     asyncio.run(
@@ -92,6 +100,13 @@ def test_server_registers_list_read_add_remove_tools_and_defaults_mutations_to_d
     asyncio.run(server.call_tool("rename_track", {"card_id": "card-1", "track_key": "track-1",
                                             "artist": "Example Artist", "title": "Example Song"}))
     asyncio.run(server.call_tool("remove_track", {"card_id": "card-1", "track_key": "track-1"}))
+    asyncio.run(server.call_tool("remove_empty_chapter", {
+        "card_id": "card-1", "chapter_key": "chapter-empty", "expected_title": "Empty interlude",
+    }))
+    asyncio.run(server.call_tool("remove_empty_chapter", {
+        "card_id": "card-1", "chapter_key": "chapter-empty", "expected_title": "Empty interlude",
+        "dry_run": False,
+    }))
     asyncio.run(server.call_tool("upload_icon", {"file_path": "cat.png"}))
     asyncio.run(server.call_tool("set_track_icon", {"card_id": "card-1", "track_key": "track-1",
                                                "media_id": "abc123"}))
@@ -104,6 +119,8 @@ def test_server_registers_list_read_add_remove_tools_and_defaults_mutations_to_d
         ("add_mp3", "card-1", "chapter-1", "song.mp3", True, None),
         ("rename_track", "card-1", "track-1", "Example Artist", "Example Song", True),
         ("remove_track", "card-1", "track-1", True),
+        ("remove_empty_chapter", "card-1", "chapter-empty", "Empty interlude", True),
+        ("remove_empty_chapter", "card-1", "chapter-empty", "Empty interlude", False),
         ("upload_icon", "cat.png", True, None, True),
         ("set_track_icon", "card-1", "track-1", "abc123", True),
         ("reorder_chapters", "card-1", ("chapter-2", "chapter-1"), True),
@@ -143,6 +160,7 @@ def test_default_factory_uses_auth_manager_token_and_write_settings(monkeypatch,
         "add_mp3",
         "rename_track",
         "remove_track",
+        "remove_empty_chapter",
         "inspect_mp3_metadata",
         "lookup_recordings",
         "upload_icon",

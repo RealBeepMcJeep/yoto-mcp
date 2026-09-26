@@ -19,9 +19,10 @@ async def smoke() -> None:
     ):
         hello = await session.initialize()
         tools = await session.list_tools()
-        if hello.server_info.name != "yoto-mcp" or not any(
-            item.name == "add_youtube" for item in tools.tools
-        ):
+        tool_names = {item.name for item in tools.tools}
+        if hello.server_info.name != "yoto-mcp" or not {
+            "add_youtube", "remove_empty_chapter",
+        } <= tool_names:
             raise RuntimeError("Default stdio MCP handshake returned unexpected tools")
         print(f"Stdio smoke passed: {len(tools.tools)} tools, {hello.protocol_version}")
 

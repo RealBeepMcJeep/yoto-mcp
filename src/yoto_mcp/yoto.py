@@ -542,6 +542,141 @@ class YotoClient:
             raise YotoAPIError("Yoto did not confirm the removed track")
         return verified
 
+    def remove_empty_chapter(
+        self,
+        card_id: str,
+        chapter_key: str,
+        expected_title: str,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        card_id = self._required_id(card_id, "card id")
+        if not isinstance(chapter_key, str):
+            raise TypeError("Chapter key must be a string")
+        if not chapter_key.strip():
+            raise ValueError("A chapter key is required")
+        if not isinstance(expected_title, str):
+            raise TypeError("Expected title must be a string")
+        if not expected_title.strip():
+            raise ValueError("Expected title is required")
+        if not isinstance(dry_run, bool):
+            raise TypeError("dry_run must be a boolean")
+        if not dry_run:
+            self._require_writes_enabled()
+
+        card = self._fetch_playlist(card_id, include_pending=False)
+        content = card.get("content")
+        if not isinstance(content, dict):
+            raise YotoAPIError("Playlist has no valid chapter list")
+        chapters = content.get("chapters")
+        if not isinstance(chapters, list) or any(not isinstance(chapter, dict) for chapter in chapters):
+            raise YotoAPIError("Playlist has no valid chapter list")
+        matches = [
+            (index, chapter) for index, chapter in enumerate(chapters)
+            if chapter.get("key") == chapter_key
+        ]
+        if not matches:
+            raise ValueError("Chapter key was not found in the playlist")
+        if len(matches) != 1:
+            raise ValueError("Chapter key is not unique in the playlist; refusing removal")
+        target_index, target = matches[0]
+        if target.get("title") != expected_title:
+            raise ValueError("Chapter title does not match the expected title")
+        if target.get("tracks") != []:
+            raise ValueError("Chapter must have an empty tracks list")
+        if any(
+            not isinstance(chapter.get("tracks"), list)
+            or any(not isinstance(track, dict) for track in chapter["tracks"])
+            for chapter in chapters
+        ):
+            raise YotoAPIError("Playlist has invalid chapter tracks")
+
+        config = content.get("config", {})
+        if not isinstance(config, dict):
+            raise TypeError("Playlist shuffle configuration is invalid")
+        shuffle_entries = config.get("shuffle", [])
+        if not isinstance(shuffle_entries, list):
+            raise TypeError("Playlist shuffle configuration is invalid")
+        for entry in shuffle_entries:
+            if not isinstance(entry, dict):
+                raise TypeError("Playlist shuffle configuration is invalid")
+            start, end, limit = (entry.get(field) for field in ("start", "end", "limit"))
+            if (
+                isinstance(start, bool) or not isinstance(start, int)
+                or isinstance(end, bool) or not isinstance(end, int)
+                or isinstance(limit, bool) or not isinstance(limit, int)
+            ):
+                raise TypeError("Playlist shuffle configuration is invalid")
+            if start < 0 or end < start or limit < 1 or limit > end - start + 1:
+                raise ValueError("Playlist shuffle configuration is invalid")
+            if end >= target_index:
+                raise ValueError("Chapter removal overlaps a shuffle range")
+
+        old_track_count = sum(len(chapter["tracks"]) for chapter in chapters)
+        preview = {
+            "dry_run": True,
+            "action": "remove_empty_chapter",
+            "cardId": card_id,
+            "chapter_key": chapter_key,
+            "title": expected_title,
+            "old_chapter_count": len(chapters),
+            "new_chapter_count": len(chapters) - 1,
+            "old_track_count": old_track_count,
+            "new_track_count": old_track_count,
+        }
+        if dry_run:
+            return preview
+
+        expected_chapters = copy.deepcopy(chapters)
+        del expected_chapters[target_index]
+        for index in range(target_index + 1, len(chapters)):
+            chapter = expected_chapters[index - 1]
+            previous_ordinal = index + 1
+            for item in [chapter, *chapter["tracks"]]:
+                label = item.get("overlayLabel")
+                if label == str(previous_ordinal):
+                    item["overlayLabel"] = str(previous_ordinal - 1)
+                elif isinstance(label, int) and not isinstance(label, bool) and label == previous_ordinal:
+                    item["overlayLabel"] = previous_ordinal - 1
+        card["content"]["chapters"] = expected_chapters
+        try:
+            self._api_json("POST", "/content", json=card)
+        except YotoAPIError:
+            # A lost response makes the write outcome uncertain; never retry it.
+            # Read the card once to determine whether the requested state landed.
+            pass
+        verified = self._fetch_playlist(card_id, include_pending=False)
+        verified_content = verified.get("content")
+        verified_chapters = (
+            verified_content.get("chapters") if isinstance(verified_content, dict) else None
+        )
+
+        def stable_signature(chapter: dict[str, Any]) -> tuple[Any, ...]:
+            tracks = chapter.get("tracks")
+            if not isinstance(tracks, list) or any(not isinstance(track, dict) for track in tracks):
+                raise YotoAPIError("Yoto returned invalid chapter tracks")
+
+            def item_fields(item: dict[str, Any]) -> tuple[Any, ...]:
+                display = item.get("display") or {}
+                if not isinstance(display, dict):
+                    raise YotoAPIError("Yoto returned invalid chapter display")
+                media = item.get("trackUrl")
+                return (
+                    item.get("key"), item.get("title"), item.get("overlayLabel"),
+                    display.get("icon16x16"),
+                    media if isinstance(media, str) and media.startswith("yoto:#") else None,
+                )
+
+            return item_fields(chapter), tuple(item_fields(track) for track in tracks)
+
+        if (
+            not isinstance(verified_chapters, list)
+            or any(not isinstance(chapter, dict) for chapter in verified_chapters)
+            or [stable_signature(chapter) for chapter in verified_chapters]
+            != [stable_signature(chapter) for chapter in expected_chapters]
+        ):
+            raise YotoAPIError("Yoto did not confirm the empty chapter removal")
+        return verified
+
     def upload_icon(
         self,
         file_path: str,

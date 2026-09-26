@@ -1262,3 +1262,275 @@ def test_add_mp3_does_not_mark_source_when_reserved_track_reads_back_in_wrong_ch
     assert [request.method for request in requests].count("PUT") == 0
     assert [request.method for request in requests].count("POST") == 1
     assert audio_sources == []
+
+
+def _chapter_removal_card() -> dict:
+    card = copy.deepcopy(CARD)
+    card["content"]["config"] = {"shuffle": [{"start": 0, "end": 0, "limit": 1}]}
+    card["content"]["chapters"] = [
+        {
+            "key": "chapter-before", "title": "Before", "overlayLabel": "1",
+            "display": {"icon16x16": "yoto:#before"},
+            "tracks": [{
+                "key": "track-before", "title": "Before track", "overlayLabel": "1",
+                "display": {"icon16x16": "yoto:#before-track"}, "duration": 2, "fileSize": 20,
+            }],
+        },
+        {
+            "key": "chapter-empty", "title": "Empty interlude", "overlayLabel": "2",
+            "tracks": [],
+        },
+        {
+            "key": "chapter-after", "title": "After", "overlayLabel": "3",
+            "display": {"icon16x16": "yoto:#after"},
+            "tracks": [{
+                "key": "track-after", "title": "After track", "overlayLabel": "3",
+                "display": {"icon16x16": "yoto:#after-track"}, "duration": 3, "fileSize": 30,
+            }, {
+                "key": "track-custom", "title": "Custom label", "overlayLabel": "featured",
+                "display": {"icon16x16": "yoto:#custom-track"}, "duration": 4, "fileSize": 40,
+            }],
+        },
+    ]
+    return card
+
+
+def _chapter_removal_client(card=None, *, allow_writes=False, post_behavior=None):
+    requests: list[httpx.Request] = []
+    posted_cards: list[dict] = []
+    current_card = copy.deepcopy(card if card is not None else _chapter_removal_card())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal current_card
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/content/card-1":
+            return httpx.Response(200, json={"card": copy.deepcopy(current_card)}, request=request)
+        if request.method == "POST" and request.url.path == "/content":
+            submitted = json.loads(request.content)
+            posted_cards.append(copy.deepcopy(submitted))
+            current_card = submitted
+            if post_behavior is not None:
+                def set_card(card):
+                    nonlocal current_card
+                    current_card = copy.deepcopy(card)
+
+                return post_behavior(submitted, request, set_card)
+            return httpx.Response(204, request=request)
+        raise AssertionError("Unexpected request")
+
+    client = YotoClient(
+        lambda: "test-token", transport=httpx.MockTransport(handler), allow_writes=allow_writes,
+    )
+    return client, requests, posted_cards
+
+
+def test_remove_empty_chapter_defaults_to_safe_preview_with_exact_target_and_counts():
+    client, requests, posted = _chapter_removal_client()
+
+    preview = client.remove_empty_chapter("card-1", "chapter-empty", "Empty interlude")
+
+    assert preview == {
+        "dry_run": True,
+        "action": "remove_empty_chapter",
+        "cardId": "card-1",
+        "chapter_key": "chapter-empty",
+        "title": "Empty interlude",
+        "old_chapter_count": 3,
+        "new_chapter_count": 2,
+        "old_track_count": 3,
+        "new_track_count": 3,
+    }
+    assert [request.method for request in requests] == ["GET"]
+    assert posted == []
+
+
+def test_remove_empty_chapter_writes_once_preserves_survivors_and_shifts_only_generated_labels():
+    client, requests, posted = _chapter_removal_client(allow_writes=True)
+
+    result = client.remove_empty_chapter(
+        "card-1", "chapter-empty", "Empty interlude", dry_run=False,
+    )
+
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+    assert len(posted) == 1
+    submitted_chapters = posted[0]["content"]["chapters"]
+    assert [chapter["key"] for chapter in submitted_chapters] == ["chapter-before", "chapter-after"]
+    assert submitted_chapters[0] == _chapter_removal_card()["content"]["chapters"][0]
+    after = submitted_chapters[1]
+    assert after["title"] == "After"
+    assert after["display"] == {"icon16x16": "yoto:#after"}
+    assert after["overlayLabel"] == "2"
+    assert [track["key"] for track in after["tracks"]] == ["track-after", "track-custom"]
+    assert after["tracks"][0]["overlayLabel"] == "2"
+    assert after["tracks"][0]["display"] == {"icon16x16": "yoto:#after-track"}
+    assert after["tracks"][1]["overlayLabel"] == "featured"
+    assert after["tracks"][1]["display"] == {"icon16x16": "yoto:#custom-track"}
+    assert result == posted[0]
+
+
+@pytest.mark.parametrize(
+    ("shuffle", "error"),
+    [
+        ([{"start": 0, "end": 1, "limit": 1}], ValueError),
+        ([{"start": -1, "end": 0, "limit": 1}], ValueError),
+        ([{"start": 0, "end": 2, "limit": 4}], ValueError),
+        ([{"start": 0, "end": 0}], TypeError),
+        ("not-a-list", TypeError),
+        ([None], TypeError),
+    ],
+)
+def test_remove_empty_chapter_fails_closed_for_overlapping_or_invalid_shuffle_ranges(shuffle, error):
+    card = _chapter_removal_card()
+    card["content"]["config"]["shuffle"] = shuffle
+    client, requests, posted = _chapter_removal_client(card, allow_writes=True)
+
+    with pytest.raises(error, match="shuffle"):
+        client.remove_empty_chapter("card-1", "chapter-empty", "Empty interlude", dry_run=False)
+
+    assert [request.method for request in requests] == ["GET"]
+    assert posted == []
+
+
+def test_remove_empty_chapter_allows_live_shaped_shuffle_before_late_target():
+    card = _chapter_removal_card()
+    chapters = []
+    for index in range(60):
+        chapters.append({
+            "key": f"chapter-{index}", "title": f"Chapter {index}",
+            "overlayLabel": str(index + 1), "tracks": [],
+        })
+    chapters[58] = {
+        "key": "chapter-empty", "title": "Empty interlude", "tracks": [],
+    }
+    card["content"]["chapters"] = chapters
+    shuffle = [{"start": 0, "end": 1, "limit": 2}]
+    card["content"]["config"]["shuffle"] = copy.deepcopy(shuffle)
+    client, requests, posted = _chapter_removal_client(card, allow_writes=True)
+
+    result = client.remove_empty_chapter(
+        "card-1", "chapter-empty", "Empty interlude", dry_run=False,
+    )
+
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+    assert posted[0]["content"]["config"]["shuffle"] == shuffle
+    assert len(result["content"]["chapters"]) == 59
+    assert result["content"]["chapters"][-1]["overlayLabel"] == "59"
+
+
+def test_remove_empty_chapter_reads_back_after_post_response_is_lost():
+    def lose_response(_submitted, _request, _set_card):
+        raise httpx.ReadTimeout("simulated lost response")
+
+    client, requests, posted = _chapter_removal_client(
+        allow_writes=True, post_behavior=lose_response,
+    )
+
+    result = client.remove_empty_chapter(
+        "card-1", "chapter-empty", "Empty interlude", dry_run=False,
+    )
+
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+    assert len(posted) == 1
+    assert [chapter["key"] for chapter in result["content"]["chapters"]] == [
+        "chapter-before", "chapter-after",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("card_change", "expected_title", "error", "message"),
+    [
+        (lambda card: card["content"]["chapters"][1].pop("tracks"), "Empty interlude", ValueError, "empty tracks list"),
+        (lambda card: card["content"]["chapters"][1].update(tracks=None), "Empty interlude", ValueError, "empty tracks list"),
+        (lambda card: card["content"]["chapters"][1].update(tracks=[{"key": "occupied"}]), "Empty interlude", ValueError, "empty tracks list"),
+        (lambda card: card["content"]["chapters"][1].update(title="Changed title"), "Empty interlude", ValueError, "title does not match"),
+        (lambda card: card["content"]["chapters"][1].update(key="unknown"), "Empty interlude", ValueError, "not found"),
+        (lambda card: card["content"]["chapters"].append(copy.deepcopy(card["content"]["chapters"][1])), "Empty interlude", ValueError, "not unique"),
+    ],
+)
+def test_remove_empty_chapter_refuses_malformed_or_changed_target(card_change, expected_title, error, message):
+    card = _chapter_removal_card()
+    card_change(card)
+    client, requests, posted = _chapter_removal_client(card, allow_writes=True)
+
+    with pytest.raises(error, match=message):
+        client.remove_empty_chapter("card-1", "chapter-empty", expected_title, dry_run=False)
+
+    assert [request.method for request in requests] == ["GET"]
+    assert posted == []
+
+
+def test_remove_empty_chapter_rejects_missing_or_blank_identifiers_before_network():
+    client, requests, _ = _chapter_removal_client()
+
+    for arguments in [
+        (" ", "chapter-empty", "Empty interlude"),
+        ("card-1", "\t", "Empty interlude"),
+        ("card-1", "chapter-empty", " "),
+        ("card-1", "chapter-empty", None),
+    ]:
+        with pytest.raises((TypeError, ValueError)):
+            client.remove_empty_chapter(*arguments)
+
+    assert requests == []
+
+
+def test_remove_empty_chapter_write_gate_blocks_before_reading_card():
+    client, requests, posted = _chapter_removal_client()
+
+    with pytest.raises(PermissionError, match="YOTO_ALLOW_WRITES=1"):
+        client.remove_empty_chapter(
+            "card-1", "chapter-empty", "Empty interlude", dry_run=False,
+        )
+
+    assert requests == []
+    assert posted == []
+
+
+def test_remove_empty_chapter_accepts_upstream_added_volatile_fields_on_survivors():
+    def add_server_field(submitted, request, set_card):
+        normalized = copy.deepcopy(submitted)
+        normalized["content"]["chapters"][1]["serverVersion"] = "server-normalized"
+        set_card(normalized)
+        return httpx.Response(204, request=request)
+
+    client, requests, posted = _chapter_removal_client(
+        allow_writes=True, post_behavior=add_server_field,
+    )
+
+    result = client.remove_empty_chapter(
+        "card-1", "chapter-empty", "Empty interlude", dry_run=False,
+    )
+
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+    assert len(posted) == 1
+    assert result["content"]["chapters"][1]["serverVersion"] == "server-normalized"
+
+
+def test_remove_empty_chapter_rejects_readback_that_does_not_match_requested_state():
+    original = _chapter_removal_card()
+
+    def restore_original(_submitted, _request, set_card):
+        set_card(original)
+        return httpx.Response(204)
+
+    client, requests, posted = _chapter_removal_client(
+        original, allow_writes=True, post_behavior=restore_original,
+    )
+
+    with pytest.raises(YotoAPIError, match="did not confirm"):
+        client.remove_empty_chapter(
+            "card-1", "chapter-empty", "Empty interlude", dry_run=False,
+        )
+
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+    assert len(posted) == 1
+
+
+def test_remove_empty_chapter_does_not_normalize_the_exact_chapter_key():
+    client, requests, posted = _chapter_removal_client()
+
+    with pytest.raises(ValueError, match="not found"):
+        client.remove_empty_chapter("card-1", " chapter-empty ", "Empty interlude")
+
+    assert [request.method for request in requests] == ["GET"]
+    assert posted == []

@@ -1,5 +1,9 @@
 # Changelog
 
+## Guarded empty-chapter removal
+
+- Added `remove_empty_chapter(card_id, chapter_key, expected_title, dry_run=true)`. A write requires `YOTO_ALLOW_WRITES=1` and explicit `dry_run=false`, an exact one-of-one empty chapter, a matching title and no shuffle range spanning the target. Other chapters/tracks remain in order, generated ordinal labels shift when applicable, and a fresh card readback checks the surviving identities, titles, icons, audio hashes and labels. No underlying media or icons are deleted.
+
 ## Reuse existing Yoto audio
 
 - When Yoto reports that an audio SHA-256 already exists (`uploadUrl: null` plus an upload ID), skip the signed PUT, validate the existing transcode, and continue the guarded card save/readback. Bad IDs and incomplete or errored transcodes still fail closed; ordinary signed URLs retain host validation.

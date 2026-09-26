@@ -193,6 +193,20 @@ def create_server(
         return client.remove_track(card_id, track_key, dry_run=dry_run)
 
     @server.tool(
+        name="remove_empty_chapter",
+        description="Remove one exactly matched chapter only when its tracks list is empty; defaults to a no-write preview.",
+    )
+    def remove_empty_chapter(
+        card_id: str,
+        chapter_key: str,
+        expected_title: str,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        return client.remove_empty_chapter(
+            card_id, chapter_key, expected_title, dry_run=dry_run,
+        )
+
+    @server.tool(
         name="upload_icon",
         description="Upload a local PNG/JPEG/GIF under YOTO_UPLOAD_ROOT as a Yoto custom icon; returns a mediaId for set_track_icon. Does not assign it to anything.",
     )

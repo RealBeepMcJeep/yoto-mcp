@@ -5,7 +5,7 @@ An independent Python MCP server for managing your own Yoto Make Your Own playli
 ## Features
 
 - List playlists and read chapters/tracks.
-- Dry-run-first upload, rename, removal, chapter ordering, owned-track export, and per-track icon tools.
+- Dry-run-first upload, rename, track removal, chapter ordering, owned-track export, and per-track icon tools. `remove_empty_chapter` accepts an exact chapter key and expected title, refuses nonempty chapters or overlapping shuffle ranges, and checks a fresh readback after the card save. It never deletes the underlying media or icon.
 - `add_youtube` downloads one exact YouTube video or supported video URL with pinned yt-dlp, converts/validates an MP3 with FFmpeg, suggests metadata, and applies the channel avatar as a custom icon. Jobs have persisted status, previews, duplicate review and guarded recovery. The upload path reuses Yoto audio when an existing SHA-256 yields `uploadUrl: null`; verified jobs record `audio_source` as `existing_yoto_media` or `uploaded`. Respect rights and the services' terms when sourcing audio.
 - Local stdio by default; opt-in bearer-protected Streamable HTTP for a trusted Docker network.
 
