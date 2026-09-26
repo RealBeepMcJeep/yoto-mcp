@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 import unicodedata
 from collections.abc import Callable
@@ -428,10 +429,21 @@ class YouTubeCoordinator:
             def upload_failure(operation: str, exc: Exception) -> None:
                 self._record_upload_failure(job_id, operation, exc, attempt=attempt)
 
+            def audio_source(source: str) -> None:
+                if source not in {"existing_yoto_media", "uploaded"}:
+                    raise RuntimeError("Audio source callback returned an invalid value")
+                self.store.update(job_id, audio_source=source)
+
+            callbacks = {
+                "on_reserved": reserved,
+                "on_media_hash": media,
+                "on_failure": upload_failure,
+            }
+            if self._supports_keyword(self.client.add_mp3, "on_audio_source"):
+                callbacks["on_audio_source"] = audio_source
             self.client.add_mp3(
                 job["card_id"], "new", str(mp3), dry_run=False,
-                title=prepared["title_label"], on_reserved=reserved,
-                on_media_hash=media, on_failure=upload_failure,
+                title=prepared["title_label"], **callbacks,
             )
             self._confirm_audio(job_id)
             self._finish_icon(job_id)
@@ -447,6 +459,17 @@ class YouTubeCoordinator:
         self.store.update(
             job_id, audio_status="verified", status="audio_added_icon_pending",
             stage="icon", resume_from="icon", write_intent=None,
+        )
+
+    @staticmethod
+    def _supports_keyword(function: Callable[..., Any], keyword: str) -> bool:
+        try:
+            parameters = inspect.signature(function).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == keyword or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
         )
 
     def _finish_icon(self, job_id: str) -> None:

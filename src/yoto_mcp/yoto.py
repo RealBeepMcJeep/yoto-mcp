@@ -182,6 +182,7 @@ class YotoClient:
         title: str | None = None,
         on_reserved: Callable[[str, str], None] | None = None,
         on_media_hash: Callable[[str], None] | None = None,
+        on_audio_source: Callable[[str], None] | None = None,
         on_failure: Callable[[str, Exception], None] | None = None,
     ) -> dict[str, Any]:
         """Upload an MP3, optionally journaling its exact remote identity.
@@ -190,6 +191,8 @@ class YotoClient:
         playlist read/reservation and before upload network requests. After
         transcode and whole-card assembly, ``on_media_hash(media_hash)`` runs
         synchronously immediately before the full-card POST.
+        ``on_audio_source(source)`` runs after the exact added track is read
+        back, with ``existing_yoto_media`` or ``uploaded``.
         ``on_failure(operation, exception)`` reports one of the allowlisted
         upload boundaries; callback exceptions propagate like journal callback
         exceptions. A reservation failure prevents upload; a media-journal
@@ -202,6 +205,8 @@ class YotoClient:
             raise TypeError("on_reserved must be callable")
         if on_media_hash is not None and not callable(on_media_hash):
             raise TypeError("on_media_hash must be callable")
+        if on_audio_source is not None and not callable(on_audio_source):
+            raise TypeError("on_audio_source must be callable")
         if on_failure is not None and not callable(on_failure):
             raise TypeError("on_failure must be callable")
 
@@ -290,44 +295,52 @@ class YotoClient:
                     raise YotoAPIError("Yoto returned an invalid upload request")
                 upload_url = upload.get("uploadUrl")
                 upload_id = upload.get("uploadId")
-                if not isinstance(upload_url, str) or not isinstance(upload_id, str):
-                    raise YotoAPIError("Yoto returned an invalid upload request")
-                try:
-                    parsed_upload_url = httpx.URL(upload_url)
-                except Exception:  # noqa: BLE001 - URL parser errors can echo signed URLs
-                    raise YotoAPIError("Yoto returned an invalid upload URL") from None
                 if (
-                    parsed_upload_url.scheme != "https"
-                    or parsed_upload_url.host != UPLOAD_HOST
-                    or parsed_upload_url.port not in (None, 443)
-                    or parsed_upload_url.username
-                    or parsed_upload_url.password
+                    "uploadUrl" not in upload
+                    or not isinstance(upload_id, str)
+                    or not upload_id.strip()
                 ):
-                    raise YotoAPIError("Yoto returned an invalid upload URL")
+                    raise YotoAPIError("Yoto returned an invalid upload request")
+                if upload_url is not None:
+                    if not isinstance(upload_url, str):
+                        raise YotoAPIError("Yoto returned an invalid upload URL")
+                    try:
+                        parsed_upload_url = httpx.URL(upload_url)
+                    except Exception:  # noqa: BLE001 - URL parser errors can echo signed URLs
+                        raise YotoAPIError("Yoto returned an invalid upload URL") from None
+                    if (
+                        parsed_upload_url.scheme != "https"
+                        or parsed_upload_url.host != UPLOAD_HOST
+                        or parsed_upload_url.port not in (None, 443)
+                        or parsed_upload_url.username
+                        or parsed_upload_url.password
+                    ):
+                        raise YotoAPIError("Yoto returned an invalid upload URL")
             except Exception as exc:
                 report_failure("upload_url", exc)
                 raise
 
-            # HTTP header values must be ASCII; fold diacritics/non-Latin filenames.
-            disposition_name = ascii_header_filename(source.name).replace("\\", "\\\\").replace('"', '\\"')
-            try:
-                with source.open("rb") as stream:
-                    uploaded = self._http.put(
-                        upload_url,
-                        content=stream,
-                        headers={
-                            "Content-Disposition": f'attachment; filename="{disposition_name}"',
-                            "Content-Type": "audio/mpeg",
-                        },
-                    )
-                if uploaded.is_error:
-                    raise YotoAPIError("Yoto media upload failed", http_status=uploaded.status_code)
-            except YotoAPIError as exc:
-                report_failure("upload_put", exc)
-                raise
-            except Exception as exc:  # noqa: BLE001 - transport errors may contain signed URLs
-                report_failure("upload_put", exc)
-                raise YotoAPIError("Yoto media upload failed") from None
+            if upload_url is not None:
+                # HTTP header values must be ASCII; fold diacritics/non-Latin filenames.
+                disposition_name = ascii_header_filename(source.name).replace("\\", "\\\\").replace('"', '\\"')
+                try:
+                    with source.open("rb") as stream:
+                        uploaded = self._http.put(
+                            upload_url,
+                            content=stream,
+                            headers={
+                                "Content-Disposition": f'attachment; filename="{disposition_name}"',
+                                "Content-Type": "audio/mpeg",
+                            },
+                        )
+                    if uploaded.is_error:
+                        raise YotoAPIError("Yoto media upload failed", http_status=uploaded.status_code)
+                except YotoAPIError as exc:
+                    report_failure("upload_put", exc)
+                    raise
+                except Exception as exc:  # noqa: BLE001 - transport errors may contain signed URLs
+                    report_failure("upload_put", exc)
+                    raise YotoAPIError("Yoto media upload failed") from None
 
             try:
                 self._set_pending_status(pending_key, "transcoding")
@@ -400,14 +413,21 @@ class YotoClient:
             self._api_json("POST", "/content", json=latest)
             verified = self.get_playlist(card_id)
             verified_chapters = verified.get("content", {}).get("chapters", [])
-            if not any(
+            verified_chapter = next(
+                (
+                    item for item in verified_chapters
+                    if isinstance(item, dict) and item.get("key") == chapter_key
+                ),
+                None,
+            )
+            verified_tracks = verified_chapter.get("tracks") if verified_chapter is not None else None
+            if not isinstance(verified_tracks, list) or not any(
                 item.get("key") == track_key and item.get("trackUrl") == track["trackUrl"]
-                for verified_chapter in verified_chapters
-                if isinstance(verified_chapter, dict)
-                for item in verified_chapter.get("tracks", [])
-                if isinstance(item, dict)
+                for item in verified_tracks if isinstance(item, dict)
             ):
                 raise YotoAPIError("Yoto did not confirm the added track")
+            if on_audio_source is not None:
+                on_audio_source("existing_yoto_media" if upload_url is None else "uploaded")
             return verified
         finally:
             with self._pending_lock:
@@ -798,10 +818,10 @@ class YotoClient:
             result = response.get("transcode")
             if not isinstance(result, dict):
                 raise YotoAPIError("Yoto returned an invalid transcode status")
-            if result.get("transcodedSha256"):
-                return result
             if result.get("erroredAt"):
                 raise YotoAPIError("Yoto audio transcoding failed")
+            if result.get("transcodedSha256"):
+                return result
             if attempt + 1 < self.poll_attempts and self.poll_interval > 0:
                 time.sleep(self.poll_interval)
         raise YotoAPIError("Yoto audio transcoding did not complete")

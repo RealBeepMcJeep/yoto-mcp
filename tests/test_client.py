@@ -209,15 +209,20 @@ def test_add_mp3_upload_transcode_append_and_read_back(tmp_path):
     def media_journaled(media_hash):
         journal_events.append(("media_hash", media_hash, [r.method for r in requests]))
 
+    def source_journaled(source):
+        journal_events.append(("audio_source", source, [r.method for r in requests]))
+
     result = client.add_mp3(
         "card-1", "chapter-1", "new-song.mp3",
         on_reserved=reserved,
         on_media_hash=media_journaled,
+        on_audio_source=source_journaled,
     )
 
-    assert [event[0] for event in journal_events] == ["reserved", "media_hash"]
+    assert [event[0] for event in journal_events] == ["reserved", "media_hash", "audio_source"]
     assert journal_events[0][3] == ["GET"]
     assert "POST" not in journal_events[1][2]
+    assert journal_events[2][1:] == ("uploaded", ["GET", "GET", "PUT", "GET", "GET", "GET", "POST", "GET"])
     assert [request.method for request in requests] == [
         "GET",
         "GET",
@@ -1067,3 +1072,193 @@ def test_add_mp3_reports_safe_failure_boundary_and_http_status(
         assert requests == []
     if failure in {"upload_url", "upload_put"}:
         assert all(request.method != "POST" for request in requests)
+
+
+def test_add_mp3_reuses_existing_yoto_audio_hash_without_put(tmp_path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    (root / "existing.mp3").write_bytes(b"ID3" + b"existing audio" * 30)
+    media_hash = "f" * 43
+    requests = []
+    card = copy.deepcopy(CARD)
+    saved_cards = []
+    journal = []
+
+    def handler(request):
+        nonlocal card
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/content/card-1":
+            return httpx.Response(200, json={"card": copy.deepcopy(card)}, request=request)
+        if request.method == "GET" and request.url.path == "/media/transcode/audio/uploadUrl":
+            return httpx.Response(200, json={
+                "upload": {"uploadUrl": None, "uploadId": "existing-upload"},
+            }, request=request)
+        if request.method == "GET" and request.url.path == "/media/upload/existing-upload/transcoded":
+            return httpx.Response(200, json={"transcode": {
+                "transcodedSha256": media_hash,
+                "transcodedInfo": {
+                    "duration": 8.4, "fileSize": 700, "channels": "stereo", "format": "mp3",
+                    "metadata": {"title": "Already stored"},
+                },
+            }}, request=request)
+        if request.method == "POST" and request.url.path == "/content":
+            card = json.loads(request.content)
+            saved_cards.append(copy.deepcopy(card))
+            return httpx.Response(204, request=request)
+        return httpx.Response(404, request=request)
+
+    client = YotoClient(
+        lambda: "test-token", transport=httpx.MockTransport(handler), upload_root=root,
+        allow_writes=True, dry_run=False, poll_interval=0,
+    )
+    result = client.add_mp3(
+        "card-1", "chapter-1", "existing.mp3",
+        on_reserved=lambda track, chapter: journal.append(("reserved", track, chapter)),
+        on_media_hash=lambda digest: journal.append(("media_hash", digest, [r.method for r in requests])),
+        on_audio_source=lambda source: journal.append(("audio_source", source, [r.method for r in requests])),
+    )
+
+    assert [request.method for request in requests] == ["GET", "GET", "GET", "GET", "POST", "GET"]
+    assert all(request.method != "PUT" for request in requests)
+    assert journal[0][0] == "reserved"
+    assert journal[1] == ("media_hash", media_hash, ["GET", "GET", "GET", "GET"])
+    assert journal[2] == ("audio_source", "existing_yoto_media", ["GET", "GET", "GET", "GET", "POST", "GET"])
+    added = saved_cards[0]["content"]["chapters"][0]["tracks"][-1]
+    assert added["trackUrl"] == f"yoto:#{media_hash}"
+    assert added["title"] == "Already stored"
+    assert result["content"]["chapters"][0]["tracks"][-1] == added
+
+
+@pytest.mark.parametrize(
+    "upload",
+    [
+        {"uploadId": "missing-url"},
+        {"uploadUrl": None},
+        {"uploadUrl": None, "uploadId": ""},
+        {"uploadUrl": None, "uploadId": "  "},
+        {"uploadUrl": None, "uploadId": 123},
+    ],
+)
+def test_add_mp3_rejects_missing_url_or_invalid_existing_media_upload_id(tmp_path, upload):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    (root / "candidate.mp3").write_bytes(b"ID3" + b"candidate" * 30)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/content/card-1":
+            return httpx.Response(200, json={"card": copy.deepcopy(CARD)}, request=request)
+        if request.url.path == "/media/transcode/audio/uploadUrl":
+            return httpx.Response(200, json={"upload": upload}, request=request)
+        raise AssertionError("Invalid upload allocation must not be used")
+
+    client = YotoClient(
+        lambda: "test-token", transport=httpx.MockTransport(handler), upload_root=root,
+        allow_writes=True, dry_run=False,
+    )
+    failures = []
+    with pytest.raises(YotoAPIError, match="invalid upload request"):
+        client.add_mp3(
+            "card-1", "chapter-1", "candidate.mp3",
+            on_failure=lambda operation, error: failures.append((operation, error)),
+        )
+
+    assert [request.url.path for request in requests] == [
+        "/content/card-1", "/media/transcode/audio/uploadUrl",
+    ]
+    assert failures[0][0] == "upload_url"
+
+
+@pytest.mark.parametrize(
+    "transcode",
+    [
+        {"transcodedSha256": "!" * 43, "transcodedInfo": {"duration": 1, "fileSize": 100}},
+        {"transcodedSha256": "h" * 43, "transcodedInfo": {"duration": -1, "fileSize": 100}},
+        {"transcodedSha256": "i" * 43, "transcodedInfo": {"duration": 1}},
+        {"transcodedSha256": "j" * 43, "erroredAt": "failed"},
+    ],
+)
+def test_existing_yoto_audio_requires_valid_transcode_before_card_post(tmp_path, transcode):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    (root / "candidate.mp3").write_bytes(b"ID3" + b"candidate" * 30)
+    requests = []
+    failures = []
+    audio_sources = []
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/content/card-1":
+            return httpx.Response(200, json={"card": copy.deepcopy(CARD)}, request=request)
+        if request.url.path == "/media/transcode/audio/uploadUrl":
+            return httpx.Response(200, json={"upload": {
+                "uploadUrl": None, "uploadId": "existing-candidate",
+            }}, request=request)
+        if request.url.path == "/media/upload/existing-candidate/transcoded":
+            return httpx.Response(200, json={"transcode": transcode}, request=request)
+        raise AssertionError("Invalid transcode must prevent playlist mutation")
+
+    client = YotoClient(
+        lambda: "test-token", transport=httpx.MockTransport(handler), upload_root=root,
+        allow_writes=True, dry_run=False, poll_interval=0,
+    )
+    with pytest.raises(YotoAPIError):
+        client.add_mp3(
+            "card-1", "chapter-1", "candidate.mp3",
+            on_failure=lambda operation, error: failures.append((operation, error)),
+            on_audio_source=audio_sources.append,
+        )
+
+    assert failures[0][0] == "transcode"
+    assert all(request.method != "PUT" for request in requests)
+    assert all(request.method != "POST" for request in requests)
+    assert audio_sources == []
+
+
+def test_add_mp3_does_not_mark_source_when_reserved_track_reads_back_in_wrong_chapter(tmp_path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    (root / "candidate.mp3").write_bytes(b"ID3" + b"candidate" * 30)
+    media_hash = "k" * 43
+    card = copy.deepcopy(CARD)
+    audio_sources = []
+    requests = []
+
+    def handler(request):
+        nonlocal card
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/content/card-1":
+            return httpx.Response(200, json={"card": copy.deepcopy(card)}, request=request)
+        if request.url.path == "/media/transcode/audio/uploadUrl":
+            return httpx.Response(200, json={"upload": {
+                "uploadUrl": None, "uploadId": "wrong-chapter-check",
+            }}, request=request)
+        if request.url.path == "/media/upload/wrong-chapter-check/transcoded":
+            return httpx.Response(200, json={"transcode": {
+                "transcodedSha256": media_hash,
+                "transcodedInfo": {"duration": 1, "fileSize": 100},
+            }}, request=request)
+        if request.method == "POST" and request.url.path == "/content":
+            submitted = json.loads(request.content)
+            added = submitted["content"]["chapters"][0]["tracks"][-1]
+            card = copy.deepcopy(CARD)
+            card["content"]["chapters"].append({
+                "key": "unexpected-chapter", "title": "Unexpected", "tracks": [added],
+            })
+            return httpx.Response(204, request=request)
+        raise AssertionError("Unexpected request")
+
+    client = YotoClient(
+        lambda: "test-token", transport=httpx.MockTransport(handler), upload_root=root,
+        allow_writes=True, dry_run=False, poll_interval=0,
+    )
+    with pytest.raises(YotoAPIError, match="did not confirm the added track"):
+        client.add_mp3(
+            "card-1", "chapter-1", "candidate.mp3",
+            on_audio_source=audio_sources.append,
+        )
+
+    assert [request.method for request in requests].count("PUT") == 0
+    assert [request.method for request in requests].count("POST") == 1
+    assert audio_sources == []

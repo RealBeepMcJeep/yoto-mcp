@@ -55,6 +55,7 @@ def test_preview_returns_job_id_then_status_with_prepared_mp3_and_avatar(tmp_pat
     assert completed["metadata"]["title_label"] == "Chosen Artist — Chosen Song"
     assert completed["metadata"]["source_title"] == "Original Video"
     assert completed["remote_verified"] is False
+    assert "audio_source" not in completed
     assert prepared == [("abcdefghijk", root, "Chosen Artist", "Chosen Song")]
     assert coordinator.get(job["job_id"]) == completed
     coordinator.close()
@@ -706,6 +707,7 @@ def test_upload_failure_diagnostic_is_persisted_without_exception_secrets(
         "Audio write outcome is uncertain; no automatic retry"
         if reserve_first else "YouTube job failed"
     )
+    assert "audio_source" not in persisted
     if reserve_first:
         assert failed["track_key"] == "reserved-track"
         assert failed.get("media_hash") is None
@@ -771,4 +773,148 @@ def test_resumed_upload_failure_replaces_diagnostic_with_resume_context(tmp_path
     assert resumed_failed["error"] == "Audio write outcome is uncertain; no automatic retry"
     assert calls == ["add_mp3", "add_mp3"]
     assert "secret" not in repr(resumed_failed["diagnostic"])
+    resumed.close()
+
+
+@pytest.mark.parametrize("audio_source", ["existing_yoto_media", "uploaded"])
+def test_verified_audio_source_is_durable_and_non_warning(tmp_path: Path, audio_source: str):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store_root = tmp_path / "private-jobs"
+    store = JobStore(store_root)
+
+    class SourceAwareClient:
+        def __init__(self):
+            self.card = {"cardId": "card-one", "content": {"chapters": []}}
+
+        def get_playlist(self, _card_id):
+            return deepcopy(self.card)
+
+        def add_mp3(
+            self, _card_id, _chapter, _path, *, dry_run, title, on_reserved,
+            on_media_hash, on_audio_source, on_failure=None,
+        ):
+            assert dry_run is False
+            on_reserved("source-track", "source-chapter")
+            on_media_hash("s" * 43)
+            self.card["content"]["chapters"].append({
+                "key": "source-chapter", "title": title,
+                "tracks": [{
+                    "key": "source-track", "title": title, "trackUrl": "yoto:#" + "s" * 43,
+                }],
+            })
+            verified = self.get_playlist("card-one")
+            on_audio_source(audio_source)
+            return verified
+
+        def upload_icon(self, _path, *, auto_convert, dry_run):
+            assert auto_convert and dry_run is False
+            return {"mediaId": "source-icon"}
+
+        def set_track_icon(self, _card_id, _track_key, _icon_id, *, dry_run):
+            assert dry_run is False
+            chapter = self.card["content"]["chapters"][0]
+            chapter["display"] = {"icon16x16": "yoto:#source-icon"}
+            chapter["tracks"][0]["display"] = {"icon16x16": "yoto:#source-icon"}
+            return self.get_playlist("card-one")
+
+    def prepare(_video_id, upload_root, **_kwargs):
+        mp3, avatar = upload_root / "song.mp3", upload_root / "avatar.jpg"
+        mp3.write_bytes(b"mp3")
+        avatar.write_bytes(b"jpg")
+        return {
+            "title_label": "Artist — Song", "warnings": [],
+            "mp3_path": str(mp3), "avatar_path": str(avatar),
+        }
+
+    coordinator = YouTubeCoordinator(
+        SourceAwareClient(), store, root, allow_writes=True, prepare=prepare,
+    )
+    queued = coordinator.submit("card-one", "abcdefghijk", dry_run=False)
+    completed = coordinator.wait(queued["job_id"], timeout=3)
+    durable = JobStore(store_root).get(queued["job_id"])
+
+    assert completed["status"] == "complete"
+    assert completed["audio_source"] == audio_source
+    assert durable["audio_source"] == audio_source
+    assert "audio_source" not in completed["warnings"]
+    coordinator.close()
+
+
+def test_guarded_resume_persists_existing_yoto_audio_source_only_after_readback(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store_root = tmp_path / "private-jobs"
+    store = JobStore(store_root)
+
+    class RetryClient:
+        def __init__(self):
+            self.card = {"cardId": "card-one", "content": {"chapters": []}}
+            self.add_calls = 0
+
+        def get_playlist(self, _card_id):
+            return deepcopy(self.card)
+
+        def add_mp3(
+            self, _card_id, _chapter, _path, *, dry_run, title, on_reserved,
+            on_media_hash, on_audio_source, on_failure=None,
+        ):
+            assert dry_run is False
+            self.add_calls += 1
+            if self.add_calls == 1:
+                on_reserved("reserved-track", "reserved-chapter")
+                raise RuntimeError("pre-POST failure")
+            on_reserved("reused-track", "reused-chapter")
+            on_media_hash("r" * 43)
+            self.card["content"]["chapters"].append({
+                "key": "reused-chapter", "title": title,
+                "tracks": [{
+                    "key": "reused-track", "title": title, "trackUrl": "yoto:#" + "r" * 43,
+                }],
+            })
+            verified = self.get_playlist("card-one")
+            on_audio_source("existing_yoto_media")
+            return verified
+
+        def upload_icon(self, _path, *, auto_convert, dry_run):
+            assert auto_convert and dry_run is False
+            return {"mediaId": "reused-icon"}
+
+        def set_track_icon(self, _card_id, _track_key, _icon_id, *, dry_run):
+            assert dry_run is False
+            chapter = self.card["content"]["chapters"][0]
+            chapter["display"] = {"icon16x16": "yoto:#reused-icon"}
+            chapter["tracks"][0]["display"] = {"icon16x16": "yoto:#reused-icon"}
+            return self.get_playlist("card-one")
+
+    def prepare(_video_id, upload_root, **_kwargs):
+        mp3, avatar = upload_root / "song.mp3", upload_root / "avatar.jpg"
+        mp3.write_bytes(b"mp3")
+        avatar.write_bytes(b"jpg")
+        return {
+            "title_label": "Artist — Song", "warnings": [],
+            "mp3_path": str(mp3), "avatar_path": str(avatar),
+        }
+
+    client = RetryClient()
+    first = YouTubeCoordinator(client, store, root, allow_writes=True, prepare=prepare)
+    queued = first.submit("card-one", "abcdefghijk", dry_run=False)
+    uncertain = first.wait(queued["job_id"], timeout=3)
+    assert uncertain["status"] == "audio_uncertain"
+    assert "audio_source" not in uncertain
+    first.close()
+
+    resumed = YouTubeCoordinator(
+        client, JobStore(store_root), root, allow_writes=True,
+        prepare=lambda *_args, **_kwargs: pytest.fail("guarded resume must reuse staged source"),
+    )
+    resumed.resume(queued["job_id"])
+    completed = resumed.wait(queued["job_id"], timeout=3)
+    durable = JobStore(store_root).get(queued["job_id"])
+
+    assert completed["status"] == "complete"
+    assert completed["audio_source"] == "existing_yoto_media"
+    assert durable["audio_source"] == "existing_yoto_media"
+    assert client.add_calls == 2
+    assert len(client.card["content"]["chapters"]) == 1
     resumed.close()

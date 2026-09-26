@@ -25,6 +25,7 @@ _MUTABLE_FIELDS = frozenset(
         "status",
         "resume_from",
         "audio_status",
+        "audio_source",
         "icon_status",
         "track_key",
         "chapter_key",
