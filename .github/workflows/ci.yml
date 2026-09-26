@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yoto-mcp-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync frozen dependencies
+        run: uv sync --frozen
+
+      - name: Test
+        run: uv run --frozen pytest
+
+      - name: Lint
+        # Existing source/test files are executable without shebangs; ignore only that mode warning.
+        run: uv run --frozen ruff check . --ignore EXE002
+
+      - name: Compile Python
+        run: uv run --frozen python -m compileall -q src scripts
+
+      - name: Exercise default stdio MCP transport
+        run: uv run --frozen python scripts/stdio_smoke.py
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build local smoke image
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
+          BUILD_TIME: ${{ github.event.head_commit.timestamp }}
+        run: |
+          set -euo pipefail
+          docker buildx build --load \
+            --tag "yoto-mcp-ci:${GITHUB_SHA}" \
+            --build-arg "BUILD_COMMIT=${BUILD_COMMIT}" \
+            --build-arg "BUILD_TIME=${BUILD_TIME:-unknown}" \
+            --build-arg "BUILD_TAG=ci-${GITHUB_SHA}" \
+            .
+
+      - name: Smoke-test local image
+        env:
+          YOTO_HTTP_TOKEN: ci-smoke-token-0123456789abcdef0123456789abcdef
+        run: |
+          set -euo pipefail
+          name="yoto-mcp-smoke-${GITHUB_RUN_ID}"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --rm --name "$name" \
+            --publish 127.0.0.1:18000:8000 \
+            --env YOTO_CLIENT_ID=ci-public-client \
+            --env YOTO_HTTP_TOKEN \
+            --env YOTO_ALLOWED_HOSTS='127.0.0.1,127.0.0.1:*,localhost,localhost:*,yoto-mcp,yoto-mcp:*' \
+            --env YOTO_ALLOW_WRITES=0 \
+            --env YOTO_SESSION_FILE=/var/lib/yoto-mcp/session/oauth-session.json \
+            --env YOTO_JOB_ROOT=/var/lib/yoto-mcp/jobs \
+            --env YOTO_UPLOAD_ROOT=/var/lib/yoto-mcp/uploads \
+            --tmpfs /var/lib/yoto-mcp/session:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001 \
+            --tmpfs /var/lib/yoto-mcp/jobs:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001 \
+            --tmpfs /var/lib/yoto-mcp/uploads:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001 \
+            "yoto-mcp-ci:${GITHUB_SHA}"
+          uv run --frozen python scripts/smoke.py --url http://127.0.0.1:18000

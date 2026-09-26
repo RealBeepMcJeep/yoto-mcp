@@ -1,0 +1,11 @@
+# Fail closed: only Dockerfile inputs are sent to the builder. This excludes
+# .git, .env/.secrets, .venv, caches, media and runtime state.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!src/yoto_mcp/
+!src/yoto_mcp/*.py

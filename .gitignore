@@ -1,0 +1,31 @@
+# Fail closed until new source paths are explicitly allowed.
+*
+!/.gitignore
+!/README.md
+!/CHANGELOG.md
+!/pyproject.toml
+!/uv.lock
+!/Dockerfile
+!/.dockerignore
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/*.yml
+!/scripts/
+/scripts/*
+!/scripts/*.py
+!/deploy/
+/deploy/*
+!/deploy/*.yaml
+!/deploy/*.md
+!/deploy/.env.example
+!/src/
+/src/*
+!/src/yoto_mcp/
+/src/yoto_mcp/*
+!/src/yoto_mcp/*.py
+!/tests/
+/tests/*
+!/tests/*.py
+# Session state, media and secrets remain excluded. Review git add -n before pushing.

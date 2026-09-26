@@ -1,0 +1,48 @@
+# Add only this service to an existing stack on a trusted internal network.
+# Create the three private host directories before starting; do not expose port 8000.
+services:
+  yoto-mcp:
+    image: ghcr.io/realbeepmcjeep/yoto-mcp:latest
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    environment:
+      YOTO_CLIENT_ID: "${YOTO_CLIENT_ID:?Set your Yoto public OAuth client ID}"
+      YOTO_HTTP_TOKEN: "${YOTO_HTTP_TOKEN:?Set a random 32+-character bearer token}"
+      YOTO_ALLOWED_HOSTS: "yoto-mcp,yoto-mcp:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*"
+      YOTO_ALLOW_WRITES: "0"
+      YOTO_SESSION_FILE: /var/lib/yoto-mcp/session/oauth-session.json
+      YOTO_JOB_ROOT: /var/lib/yoto-mcp/jobs
+      YOTO_UPLOAD_ROOT: /var/lib/yoto-mcp/uploads
+      ACOUSTID_API_KEY: "${ACOUSTID_API_KEY:-}"
+    volumes:
+      - type: bind
+        source: "${YOTO_DATA_ROOT:?Set a private host data directory}/session"
+        target: /var/lib/yoto-mcp/session
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${YOTO_DATA_ROOT:?Set a private host data directory}/jobs"
+        target: /var/lib/yoto-mcp/jobs
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${YOTO_DATA_ROOT:?Set a private host data directory}/uploads"
+        target: /var/lib/yoto-mcp/uploads
+        bind:
+          create_host_path: false
+    networks:
+      - mcp_internal
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  mcp_internal:
+    external: true
+    name: "${MCP_NETWORK:?Set the existing private Docker network}"

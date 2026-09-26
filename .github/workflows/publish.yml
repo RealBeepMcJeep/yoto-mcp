@@ -1,0 +1,122 @@
+# CI is a called workflow dependency here: this workflow cannot publish until
+# frozen tests, lint, image build, and the authenticated MCP smoke all pass.
+name: Publish container image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yoto-mcp-publish
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/realbeepmcjeep/yoto-mcp
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python for post-push MCP smoke
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install frozen runtime smoke dependencies
+        run: uv sync --frozen --no-dev
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build timestamp
+        id: stamp
+        run: echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.stamp.outputs.time }}
+            BUILD_TAG=sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the pushed immutable and rolling tags
+        env:
+          YOTO_HTTP_TOKEN: ci-smoke-token-0123456789abcdef0123456789abcdef
+        run: |
+          set -euo pipefail
+          image_sha="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | grep -m1 ':sha-')"
+          echo "Pulling and testing ${image_sha}"
+          docker pull "${image_sha}"
+          docker pull "${IMAGE}:latest"
+          for image in "${image_sha}" "${IMAGE}:latest"; do
+            name="yoto-mcp-publish-smoke-${GITHUB_RUN_ID}"
+            trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+            docker run --detach --rm --name "$name" \
+              --publish 127.0.0.1:18000:8000 \
+              --env YOTO_CLIENT_ID=ci-public-client \
+              --env YOTO_HTTP_TOKEN \
+              --env YOTO_ALLOWED_HOSTS='127.0.0.1,127.0.0.1:*,localhost,localhost:*,yoto-mcp,yoto-mcp:*' \
+              --env YOTO_ALLOW_WRITES=0 \
+              --env YOTO_SESSION_FILE=/var/lib/yoto-mcp/session/oauth-session.json \
+              --env YOTO_JOB_ROOT=/var/lib/yoto-mcp/jobs \
+              --env YOTO_UPLOAD_ROOT=/var/lib/yoto-mcp/uploads \
+              --tmpfs /var/lib/yoto-mcp/session:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001 \
+              --tmpfs /var/lib/yoto-mcp/jobs:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001 \
+              --tmpfs /var/lib/yoto-mcp/uploads:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001 \
+              "$image"
+            uv run --frozen python scripts/smoke.py --url http://127.0.0.1:18000
+            docker rm -f "$name" >/dev/null
+          done
+
+      # GHCR creates new packages private even for public repos. The account
+      # owner must make this package public once in GitHub Package settings,
+      # then rerun this job. Authenticated pulls above do not prove visibility.
+      - name: Verify anonymous GHCR pulls of both tags
+        run: |
+          set -euo pipefail
+          image_sha="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | grep -m1 ':sha-')"
+          uv run --frozen python scripts/verify_public_image.py "${image_sha##*:}"
+          uv run --frozen python scripts/verify_public_image.py latest
