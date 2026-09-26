@@ -31,6 +31,13 @@ jobs:
       - name: Sync frozen dependencies
         run: uv sync --frozen
 
+      - name: Install media tools required by source tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          test -x /usr/bin/ffmpeg
+          test -x /usr/bin/ffprobe
+
       - name: Test
         run: uv run --frozen pytest
 
