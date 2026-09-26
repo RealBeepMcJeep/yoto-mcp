@@ -36,11 +36,14 @@ COPY --from=builder --chown=10001:10001 /app/src /app/src
 # Fail the build if the selected Debian ffmpeg lacks features required by the
 # existing media pipeline, or if the lockfile's pinned yt-dlp is not executable.
 RUN set -eu; \
-    test -x /usr/bin/ffmpeg; \
-    test -x /usr/bin/ffprobe; \
-    /usr/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libmp3lame'; \
-    /usr/bin/ffmpeg -hide_banner -muxers 2>/dev/null | grep -q 'chromaprint'; \
-    test "$(/opt/venv/bin/yt-dlp --version)" = "2026.8.19"
+    test -x /usr/bin/ffmpeg || { echo 'Missing /usr/bin/ffmpeg'; exit 1; }; \
+    test -x /usr/bin/ffprobe || { echo 'Missing /usr/bin/ffprobe'; exit 1; }; \
+    /usr/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libmp3lame' \
+      || { echo 'FFmpeg lacks libmp3lame encoder'; exit 1; }; \
+    /usr/bin/ffmpeg -hide_banner -muxers 2>/dev/null | grep -q 'chromaprint' \
+      || { echo 'FFmpeg lacks Chromaprint muxer'; exit 1; }; \
+    /opt/venv/bin/python -c "import importlib.metadata as m; assert m.version('yt-dlp') == '2026.8.19'"; \
+    /opt/venv/bin/yt-dlp --version >/dev/null
 
 ARG BUILD_COMMIT=unknown
 ARG BUILD_TIME=unknown
