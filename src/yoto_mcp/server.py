@@ -131,7 +131,7 @@ def create_server(
             card_id, video_id, dry_run=dry_run, artist=artist, song_name=song_name,
         )
 
-    @server.tool(name="get_youtube_job", description="Read persisted YouTube job progress, warnings, and final or partial status by job ID.")
+    @server.tool(name="get_youtube_job", description="Read persisted YouTube job progress, warnings, status, and safe upload-failure diagnostics by job ID.")
     def get_youtube_job(job_id: str) -> dict[str, Any]:
         if youtube is None:
             raise ValueError("YOTO_UPLOAD_ROOT and YOTO_JOB_ROOT must be configured")

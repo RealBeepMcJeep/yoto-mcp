@@ -1,5 +1,9 @@
 # Changelog
 
+## Hosted upload diagnostics
+
+- `get_youtube_job` now exposes durable, allowlisted `diagnostic` fields when an MP3 upload fails: upload operation, safe HTTP status/category, initial-vs-resume attempt, fixed code/message. Neither raw exception text nor response bodies, file paths, tokens, or signed upload URLs are included. The guarded no-blind-retry behavior is unchanged; diagnose the underlying upload failure after deploying this version.
+
 ## Initial public snapshot
 
 - Yoto playlist MCP tools, dry-run-first writes, metadata/icon tooling, persisted YouTube jobs and guarded recovery.

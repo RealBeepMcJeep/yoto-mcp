@@ -998,3 +998,72 @@ def test_add_mp3_media_callback_exception_prevents_whole_card_post(tmp_path):
 
     assert any(request.method == "PUT" for request in requests)
     assert all(request.method != "POST" for request in requests)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_operation", "expected_status"),
+    [
+        ("local_preflight", "local_preflight", None),
+        ("upload_url", "upload_url", 503),
+        ("upload_put", "upload_put", 502),
+        ("transcode", "transcode", None),
+    ],
+)
+def test_add_mp3_reports_safe_failure_boundary_and_http_status(
+    tmp_path, failure, expected_operation, expected_status,
+):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    song = root / "song.mp3"
+    song.write_bytes(b"ID3" + b"x" * 300)
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/content/card-1":
+            return httpx.Response(200, json={"card": copy.deepcopy(CARD)}, request=request)
+        if request.url.path == "/media/transcode/audio/uploadUrl":
+            if failure == "upload_url":
+                return httpx.Response(
+                    503, text="response-body-secret https://signed.invalid/?sig=secret",
+                    request=request,
+                )
+            return httpx.Response(200, json={"upload": {
+                "uploadUrl": "https://yoto-media-api-prod-uploads.s3.eu-west-2.amazonaws.com/slot",
+                "uploadId": "diagnostic-upload",
+            }}, request=request)
+        if request.method == "PUT":
+            if failure == "upload_put":
+                return httpx.Response(
+                    502, text="upload body secret Bearer token-secret", request=request,
+                )
+            return httpx.Response(200, request=request)
+        if request.url.path == "/media/upload/diagnostic-upload/transcoded":
+            if failure == "transcode":
+                return httpx.Response(200, json={"transcode": {"erroredAt": "secret"}}, request=request)
+            raise AssertionError("The selected failure must stop before the transcode poll")
+        raise AssertionError("Unexpected request")
+
+    client = YotoClient(
+        lambda: "token-secret", transport=httpx.MockTransport(handler),
+        upload_root=root, allow_writes=True, dry_run=False, poll_interval=0,
+    )
+    failures = []
+
+    with pytest.raises((YotoAPIError, ValueError)):
+        client.add_mp3(
+            "card-1", "chapter-1", "missing.mp3" if failure == "local_preflight" else "song.mp3",
+            on_failure=lambda operation, exc: failures.append((operation, exc)),
+        )
+
+    assert len(failures) == 1
+    operation, error = failures[0]
+    assert operation == expected_operation
+    assert getattr(error, "http_status", None) == expected_status
+    assert all(secret not in str(error) for secret in (
+        "response-body-secret", "signed.invalid", "Bearer token-secret", "token-secret",
+    ))
+    if failure == "local_preflight":
+        assert requests == []
+    if failure in {"upload_url", "upload_put"}:
+        assert all(request.method != "POST" for request in requests)

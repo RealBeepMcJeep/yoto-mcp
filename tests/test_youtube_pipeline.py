@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from yoto_mcp.yoto import YotoAPIError
 from yoto_mcp.youtube_jobs import JobStore
 from yoto_mcp.youtube_pipeline import YouTubeCoordinator
 from yoto_mcp.youtube_source import YouTubeSourceError
@@ -138,7 +139,7 @@ def test_write_adds_exact_track_then_icon_without_changing_prior_chapters(tmp_pa
             assert card_id == "card-one"
             return deepcopy(self.card)
 
-        def add_mp3(self, card_id, chapter_key, file_path, *, dry_run, title, on_reserved, on_media_hash):
+        def add_mp3(self, card_id, chapter_key, file_path, *, dry_run, title, on_reserved, on_media_hash, on_failure=None):
             assert (card_id, chapter_key, dry_run, title) == (
                 "card-one", "new", False, "Chosen Artist — Chosen Song",
             )
@@ -246,7 +247,7 @@ def test_restart_resumes_pending_icon_without_readding_audio(tmp_path: Path, fai
         def get_playlist(self, _card_id):
             return deepcopy(self.card)
 
-        def add_mp3(self, _card_id, _chapter, _file, *, dry_run, title, on_reserved, on_media_hash):
+        def add_mp3(self, _card_id, _chapter, _file, *, dry_run, title, on_reserved, on_media_hash, on_failure=None):
             assert dry_run is False
             self.add_calls += 1
             on_reserved("new-track", "new-chapter")
@@ -331,7 +332,7 @@ def test_post_applied_then_timed_out_reconciles_exact_audio_without_second_add(t
         def get_playlist(self, _card_id):
             return deepcopy(self.card)
 
-        def add_mp3(self, _card_id, _chapter, _path, *, dry_run, title, on_reserved, on_media_hash):
+        def add_mp3(self, _card_id, _chapter, _path, *, dry_run, title, on_reserved, on_media_hash, on_failure=None):
             assert dry_run is False
             self.add_calls += 1
             on_reserved("exact-track", "exact-chapter")
@@ -393,7 +394,7 @@ def test_reserved_key_without_media_hash_retries_only_after_exact_absence_readba
         def get_playlist(self, _card_id):
             return deepcopy(self.card)
 
-        def add_mp3(self, _card_id, _chapter, _path, *, dry_run, title, on_reserved, on_media_hash):
+        def add_mp3(self, _card_id, _chapter, _path, *, dry_run, title, on_reserved, on_media_hash, on_failure=None):
             assert dry_run is False and title == "Artist — Song"
             self.add_calls += 1
             if self.add_calls == 1:
@@ -482,7 +483,7 @@ def test_uncertain_audio_waits_for_exact_remote_readback_then_resumes_without_re
                 "chapters": [deepcopy(self.chapter)] if self.visible else [],
             }}
 
-        def add_mp3(self, _card_id, _chapter, _path, *, dry_run, title, on_reserved, on_media_hash):
+        def add_mp3(self, _card_id, _chapter, _path, *, dry_run, title, on_reserved, on_media_hash, on_failure=None):
             assert dry_run is False and title == "Artist — Song"
             self.add_calls += 1
             on_reserved("exact-track", "exact-chapter")
@@ -556,7 +557,7 @@ def test_same_title_from_different_video_flags_source_duplicate_before_audio_wri
         def get_playlist(self, _card_id):
             return deepcopy(self.card)
 
-        def add_mp3(self, _card_id, _chapter, _path, *, dry_run, title, on_reserved, on_media_hash):
+        def add_mp3(self, _card_id, _chapter, _path, *, dry_run, title, on_reserved, on_media_hash, on_failure=None):
             assert dry_run is False
             self.add_calls += 1
             on_reserved("new-track", "new-chapter")
@@ -620,3 +621,154 @@ def test_same_title_from_different_video_flags_source_duplicate_before_audio_wri
         "key": "old-track", "title": "Artist - Song", "trackUrl": "yoto:#old",
     }
     coordinator.close()
+
+
+@pytest.mark.parametrize(
+    ("operation", "reserve_first", "expected_code", "http_status", "category"),
+    [
+        ("local_preflight", False, "local_preflight_failed", None, "unexpected"),
+        ("upload_url", True, "upload_url_failed", None, "unexpected"),
+        ("upload_put", True, "upload_put_failed", None, "unexpected"),
+        ("transcode", True, "transcode_failed", None, "unexpected"),
+        ("upload_url", True, "upload_url_failed", 503, "yoto_api"),
+    ],
+)
+def test_upload_failure_diagnostic_is_persisted_without_exception_secrets(
+    tmp_path: Path, operation: str, reserve_first: bool, expected_code: str,
+    http_status: int | None, category: str,
+):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store_root = tmp_path / "private-jobs"
+    store = JobStore(store_root)
+    secret_text = (
+        "Bearer bearer-secret https://signed.invalid/upload?sig=signed-secret "
+        "/private/absolute/path response-body-secret"
+    )
+
+    class FailingUploadClient:
+        def get_playlist(self, _card_id):
+            return {"content": {"chapters": []}}
+
+        def add_mp3(
+            self, _card_id, _chapter, _path, *, dry_run, title, on_reserved,
+            on_media_hash, on_failure,
+        ):
+            assert dry_run is False
+            if reserve_first:
+                on_reserved("reserved-track", "reserved-chapter")
+            exception = (
+                YotoAPIError("HTTP status with Bearer token-secret response-body-secret", http_status=http_status)
+                if http_status is not None else RuntimeError(secret_text)
+            )
+            on_failure(operation, exception)
+            raise exception
+
+    def prepare(_video_id, upload_root, **_kwargs):
+        mp3, avatar = upload_root / "song.mp3", upload_root / "avatar.jpg"
+        mp3.write_bytes(b"mp3")
+        avatar.write_bytes(b"jpg")
+        return {
+            "title_label": "Artist — Song", "warnings": [],
+            "mp3_path": str(mp3), "avatar_path": str(avatar),
+        }
+
+    coordinator = YouTubeCoordinator(
+        FailingUploadClient(), store, root, allow_writes=True, prepare=prepare,
+    )
+    queued = coordinator.submit("card-one", "abcdefghijk", dry_run=False)
+    failed = coordinator.wait(queued["job_id"], timeout=3)
+    persisted = JobStore(store_root).get(queued["job_id"])
+
+    assert failed["status"] == ("audio_uncertain" if reserve_first else "failed")
+    diagnostic = persisted["diagnostic"]
+    assert diagnostic == {
+        "stage": "audio_upload",
+        "operation": operation,
+        "http_status": http_status,
+        "exception_category": category,
+        "code": expected_code,
+        "attempt": "initial",
+        "message": {
+            "local_preflight": "Prepared audio files failed local validation.",
+            "upload_url": "Audio upload URL request failed.",
+            "upload_put": "Audio file upload failed.",
+            "transcode": "Audio transcoding failed.",
+        }[operation],
+    }
+    sensitive_values = (
+        "bearer-secret", "signed.invalid", "signed-secret", "/private/absolute/path",
+        "response-body-secret", "token-secret",
+    )
+    for value in diagnostic.values():
+        assert not any(secret in str(value) for secret in sensitive_values)
+    assert failed["error"] == (
+        "Audio write outcome is uncertain; no automatic retry"
+        if reserve_first else "YouTube job failed"
+    )
+    if reserve_first:
+        assert failed["track_key"] == "reserved-track"
+        assert failed.get("media_hash") is None
+    coordinator.close()
+
+
+def test_resumed_upload_failure_replaces_diagnostic_with_resume_context(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store_root = tmp_path / "private-jobs"
+    store = JobStore(store_root)
+    operations = iter(["upload_url", "transcode"])
+    calls = []
+
+    class FailingUploadClient:
+        def get_playlist(self, _card_id):
+            return {"content": {"chapters": []}}
+
+        def add_mp3(
+            self, _card_id, _chapter, _path, *, dry_run, title, on_reserved,
+            on_media_hash, on_failure,
+        ):
+            calls.append("add_mp3")
+            operation = next(operations)
+            if len(calls) == 1:
+                on_reserved("reserved-track", "reserved-chapter")
+            exception = TimeoutError("Bearer secret; signed URL https://secret.invalid")
+            on_failure(operation, exception)
+            raise exception
+
+    def prepare(_video_id, upload_root, **_kwargs):
+        mp3, avatar = upload_root / "song.mp3", upload_root / "avatar.jpg"
+        mp3.write_bytes(b"mp3")
+        avatar.write_bytes(b"jpg")
+        return {"title_label": "Artist — Song", "warnings": [],
+                "mp3_path": str(mp3), "avatar_path": str(avatar)}
+
+    client = FailingUploadClient()
+    first = YouTubeCoordinator(client, store, root, allow_writes=True, prepare=prepare)
+    job = first.submit("card-one", "abcdefghijk", dry_run=False)
+    failed = first.wait(job["job_id"], timeout=3)
+    assert failed["diagnostic"]["operation"] == "upload_url"
+    first.close()
+
+    resumed = YouTubeCoordinator(
+        client, JobStore(store_root), root, allow_writes=True,
+        prepare=lambda *_args, **_kwargs: pytest.fail("resume must use staged audio"),
+    )
+    resumed.resume(job["job_id"])
+    resumed_failed = resumed.wait(job["job_id"], timeout=3)
+    assert resumed_failed["status"] == "audio_uncertain"
+    assert resumed_failed["track_key"] == "reserved-track"
+    assert resumed_failed.get("media_hash") is None
+    assert resumed_failed["diagnostic"] == {
+        "stage": "audio_upload",
+        "operation": "transcode",
+        "http_status": None,
+        "exception_category": "timeout",
+        "code": "transcode_failed",
+        "attempt": "resume",
+        "message": "Audio transcoding failed.",
+    }
+    assert resumed_failed["error"] == "Audio write outcome is uncertain; no automatic retry"
+    assert calls == ["add_mp3", "add_mp3"]
+    assert "secret" not in repr(resumed_failed["diagnostic"])
+    resumed.close()

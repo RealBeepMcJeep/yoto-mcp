@@ -40,6 +40,7 @@ _MUTABLE_FIELDS = frozenset(
         "avatar_path",
         "remote_verified",
         "write_intent",
+        "diagnostic",
         "audio_added_at",
         "icon_assigned",
     }

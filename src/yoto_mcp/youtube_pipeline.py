@@ -10,8 +10,20 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+import httpx
+
+from .yoto import YotoAPIError
 from .youtube_jobs import JobStore
 from .youtube_source import YouTubeSourceError, parse_youtube_id, prepare_youtube
+
+_DIAGNOSTIC_DETAILS = {
+    "local_preflight": (
+        "local_preflight_failed", "Prepared audio files failed local validation.",
+    ),
+    "upload_url": ("upload_url_failed", "Audio upload URL request failed."),
+    "upload_put": ("upload_put_failed", "Audio file upload failed."),
+    "transcode": ("transcode_failed", "Audio transcoding failed."),
+}
 
 
 class YouTubeCoordinator:
@@ -134,7 +146,7 @@ class YouTubeCoordinator:
         self._pool.shutdown(wait=True)
 
     def _run_resume_source(self, job_id: str) -> None:
-        self._run(self.store.get(job_id))
+        self._run(self.store.get(job_id), attempt="resume")
 
     def _run_resume_before_post(self, job_id: str) -> None:
         job = self.store.get(job_id)
@@ -161,7 +173,7 @@ class YouTubeCoordinator:
             }
             # Keep the old reservation until the next synchronous callback replaces it.
             # A crash before that callback must leave this pre-POST state resumable.
-            self._publish(job_id, job, prepared, fields)
+            self._publish(job_id, job, prepared, fields, attempt="resume")
         except Exception:  # noqa: BLE001 - upstream failures can contain credentials
             self._handle_write_error(job_id, job)
 
@@ -216,11 +228,11 @@ class YouTubeCoordinator:
                 "metadata": metadata, "warnings": job.get("warnings", []),
                 "mp3_path": job["mp3_path"], "avatar_path": job["avatar_path"],
             }
-            self._publish(job_id, job, prepared, fields)
+            self._publish(job_id, job, prepared, fields, attempt="resume")
         except Exception:  # noqa: BLE001 - upstream failures can contain credentials
             self._handle_write_error(job_id, job)
 
-    def _run(self, job: dict[str, Any]) -> None:
+    def _run(self, job: dict[str, Any], *, attempt: str = "initial") -> None:
         job_id = job["job_id"]
         try:
             self.store.update(job_id, status="running", stage="source")
@@ -246,7 +258,7 @@ class YouTubeCoordinator:
                     remote_verified=False,
                 )
             else:
-                self._publish(job_id, job, prepared, fields)
+                self._publish(job_id, job, prepared, fields, attempt=attempt)
         except YouTubeSourceError as exc:
             self.store.update(job_id, status="failed", stage="source", error=str(exc))
         except Exception:  # noqa: BLE001 - upstream exceptions may contain credentials or signed URLs
@@ -282,6 +294,46 @@ class YouTubeCoordinator:
             )
         else:
             self.store.update(job_id, status="failed", stage="source", error="YouTube job failed")
+
+    def _record_upload_failure(
+        self, job_id: str, operation: str, exc: Exception, *, attempt: str,
+    ) -> None:
+        details = _DIAGNOSTIC_DETAILS.get(operation)
+        if details is None:
+            return
+        code, message = details
+        if isinstance(exc, YotoAPIError):
+            exception_category = exc.exception_category
+            http_status = exc.http_status
+        elif isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+            exception_category = "timeout"
+            http_status = None
+        elif isinstance(exc, (ConnectionError, httpx.TransportError)):
+            exception_category = "transport"
+            http_status = None
+        elif isinstance(exc, OSError):
+            exception_category = "local_io"
+            http_status = None
+        elif isinstance(exc, ValueError):
+            exception_category = "invalid_input"
+            http_status = None
+        else:
+            exception_category = "unexpected"
+            http_status = None
+        if not isinstance(http_status, int) or isinstance(http_status, bool):
+            http_status = None
+        self.store.update(
+            job_id,
+            diagnostic={
+                "stage": "audio_upload",
+                "operation": operation,
+                "http_status": http_status,
+                "exception_category": exception_category,
+                "code": code,
+                "attempt": attempt,
+                "message": message,
+            },
+        )
 
     @staticmethod
     def _exact_track(card: dict[str, Any], track_key: str, chapter_key: str) -> dict[str, Any]:
@@ -325,20 +377,24 @@ class YouTubeCoordinator:
 
     def _publish(
         self, job_id: str, job: dict[str, Any], prepared: dict[str, Any],
-        fields: dict[str, Any],
+        fields: dict[str, Any], *, attempt: str = "initial",
     ) -> None:
-        if not isinstance(prepared.get("avatar_path"), str) or not prepared["avatar_path"]:
-            raise YouTubeSourceError("Verified channel avatar unavailable; audio was not uploaded")
-        if not isinstance(prepared.get("mp3_path"), str) or not prepared["mp3_path"]:
-            raise YouTubeSourceError("Verified MP3 unavailable; audio was not uploaded")
-        root = self.upload_root.resolve(strict=True)
-        mp3 = Path(prepared["mp3_path"]).resolve(strict=True)
-        avatar = Path(prepared["avatar_path"]).resolve(strict=True)
-        if (
-            not mp3.is_file() or not avatar.is_file()
-            or not mp3.is_relative_to(root) or not avatar.is_relative_to(root)
-        ):
-            raise ValueError("Prepared source files escaped YOTO_UPLOAD_ROOT")
+        try:
+            if not isinstance(prepared.get("avatar_path"), str) or not prepared["avatar_path"]:
+                raise YouTubeSourceError("Verified channel avatar unavailable; audio was not uploaded")
+            if not isinstance(prepared.get("mp3_path"), str) or not prepared["mp3_path"]:
+                raise YouTubeSourceError("Verified MP3 unavailable; audio was not uploaded")
+            root = self.upload_root.resolve(strict=True)
+            mp3 = Path(prepared["mp3_path"]).resolve(strict=True)
+            avatar = Path(prepared["avatar_path"]).resolve(strict=True)
+            if (
+                not mp3.is_file() or not avatar.is_file()
+                or not mp3.is_relative_to(root) or not avatar.is_relative_to(root)
+            ):
+                raise ValueError("Prepared source files escaped YOTO_UPLOAD_ROOT")
+        except Exception as exc:
+            self._record_upload_failure(job_id, "local_preflight", exc, attempt=attempt)
+            raise
         with self._lock:
             card_lock = self._card_locks.setdefault(job["card_id"], Lock())
         with card_lock:
@@ -369,9 +425,13 @@ class YouTubeCoordinator:
             def media(media_hash: str) -> None:
                 self.store.update(job_id, media_hash=media_hash)
 
+            def upload_failure(operation: str, exc: Exception) -> None:
+                self._record_upload_failure(job_id, operation, exc, attempt=attempt)
+
             self.client.add_mp3(
                 job["card_id"], "new", str(mp3), dry_run=False,
-                title=prepared["title_label"], on_reserved=reserved, on_media_hash=media,
+                title=prepared["title_label"], on_reserved=reserved,
+                on_media_hash=media, on_failure=upload_failure,
             )
             self._confirm_audio(job_id)
             self._finish_icon(job_id)

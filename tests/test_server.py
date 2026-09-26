@@ -306,3 +306,39 @@ def test_resume_youtube_job_tool_routes_exact_job_id(tmp_path: Path):
         "job_id": "job-one", "status": "audio_added_icon_pending",
     }
     assert seen == [("job-one", True, "known-icon")]
+
+
+def test_get_youtube_job_returns_persisted_safe_diagnostic(tmp_path: Path):
+    diagnostic = {
+        "stage": "audio_upload",
+        "operation": "upload_put",
+        "http_status": 502,
+        "exception_category": "yoto_api",
+        "code": "upload_put_failed",
+        "attempt": "resume",
+        "message": "Audio file upload failed.",
+    }
+
+    class FakeYouTube:
+        def get(self, job_id):
+            return {
+                "job_id": job_id,
+                "status": "audio_uncertain",
+                "error": "Audio write outcome is uncertain; no automatic retry",
+                "track_key": "reserved-track",
+                "media_hash": None,
+                "diagnostic": diagnostic,
+            }
+
+    server = create_server(
+        Settings(upload_root=tmp_path / "uploads", job_root=tmp_path / "jobs"),
+        client_factory=lambda _: RecordingClient(),
+        youtube_factory=lambda _client, _settings: FakeYouTube(),
+    )
+    result = asyncio.run(server.call_tool("get_youtube_job", {"job_id": "job-one"}))
+
+    assert isinstance(result, CallToolResult)
+    assert result.structured_content["diagnostic"] == diagnostic
+    assert result.structured_content["error"] == "Audio write outcome is uncertain; no automatic retry"
+    assert result.structured_content["track_key"] == "reserved-track"
+    assert result.structured_content["media_hash"] is None
