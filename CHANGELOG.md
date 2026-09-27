@@ -1,5 +1,10 @@
 # Changelog
 
+## Lyric evidence lookup and job diagnostic cleanup
+
+- Added read-only `lookup_lyric_evidence` backed by LRCLIB `GET /api/get`: artist/title required, album/duration optional. Returns an explicit status instead of raising on a miss, honors `Retry-After` on 429, identifies the client via `User-Agent`, and never echoes raw provider bodies in errors. No Yoto access, persistence or transcription.
+- A YouTube job that recovered after an earlier upload-stage failure no longer keeps the stale `diagnostic` from that failed attempt once the audio write is confirmed by exact readback.
+
 ## Optional YouTube source-timeline ranges
 - `add_youtube` accepts optional `start_time`/`end_time` on the original source timeline, validates the selected interval against decoded audio and checks the trimmed MP3's duration. Exact intervals are part of durable job identity, including recovery and duplicate review; old full-source jobs remain compatible. Source, fake-client, real FFmpeg clip and MCP schema tests cover the feature. Deployment and a live Yoto write require a separately verified image and explicit user operation.
 

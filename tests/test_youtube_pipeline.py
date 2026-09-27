@@ -776,6 +776,75 @@ def test_resumed_upload_failure_replaces_diagnostic_with_resume_context(tmp_path
     resumed.close()
 
 
+def test_resumed_success_after_earlier_failure_clears_stale_diagnostic(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    original = {"key": "old-chapter", "title": "Keep", "tracks": [
+        {"key": "old-track", "title": "Keep", "trackUrl": "yoto:#old"},
+    ]}
+    calls = []
+
+    class RecoveringClient:
+        def __init__(self):
+            self.card = {"cardId": "card-one", "content": {"chapters": [deepcopy(original)]}}
+
+        def get_playlist(self, card_id):
+            return deepcopy(self.card)
+
+        def add_mp3(
+            self, card_id, chapter_key, file_path, *, dry_run, title,
+            on_reserved, on_media_hash, on_failure=None,
+        ):
+            calls.append("add_mp3")
+            on_reserved("reserved-track", "reserved-chapter")
+            if len(calls) == 1:
+                exception = TimeoutError("transient network blip")
+                on_failure("upload_url", exception)
+                raise exception
+            on_media_hash("m" * 43)
+            self.card["content"]["chapters"].append({
+                "key": "reserved-chapter", "title": title, "tracks": [
+                    {"key": "reserved-track", "title": title, "trackUrl": "yoto:#" + "m" * 43},
+                ],
+            })
+            return self.get_playlist(card_id)
+
+        def upload_icon(self, file_path, *, auto_convert, dry_run):
+            return {"mediaId": "new-icon"}
+
+        def set_track_icon(self, card_id, track_key, media_id, *, dry_run):
+            chapter = self.card["content"]["chapters"][-1]
+            chapter["tracks"][0]["display"] = {"icon16x16": "yoto:#new-icon"}
+            chapter["display"] = {"icon16x16": "yoto:#new-icon"}
+            return self.get_playlist(card_id)
+
+    def prepare(_video_id, upload_root, **_kwargs):
+        mp3, avatar = upload_root / "song.mp3", upload_root / "avatar.jpg"
+        mp3.write_bytes(b"mp3")
+        avatar.write_bytes(b"jpg")
+        return {"title_label": "Artist — Song", "warnings": [],
+                "mp3_path": str(mp3), "avatar_path": str(avatar)}
+
+    client = RecoveringClient()
+    coordinator = YouTubeCoordinator(client, store, root, allow_writes=True, prepare=prepare)
+    queued = coordinator.submit("card-one", "abcdefghijk", dry_run=False)
+    failed = coordinator.wait(queued["job_id"], timeout=3)
+    assert failed["status"] == "audio_uncertain"
+    assert failed["diagnostic"]["operation"] == "upload_url"
+    assert failed.get("media_hash") is None
+
+    coordinator.resume(queued["job_id"])
+    completed = coordinator.wait(queued["job_id"], timeout=3)
+
+    assert completed["status"] == "complete"
+    assert completed["audio_status"] == "verified"
+    assert completed["icon_status"] == "assigned"
+    assert completed.get("diagnostic") is None
+    assert calls == ["add_mp3", "add_mp3"]
+    coordinator.close()
+
+
 @pytest.mark.parametrize("audio_source", ["existing_yoto_media", "uploaded"])
 def test_verified_audio_source_is_durable_and_non_warning(tmp_path: Path, audio_source: str):
     root = tmp_path / "uploads"

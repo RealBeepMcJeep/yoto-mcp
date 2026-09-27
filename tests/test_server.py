@@ -77,6 +77,7 @@ def test_server_registers_list_read_add_remove_tools_and_defaults_mutations_to_d
         "remove_empty_chapter",
         "inspect_mp3_metadata",
         "lookup_recordings",
+        "lookup_lyric_evidence",
         "upload_icon",
         "set_track_icon",
         "reorder_chapters",
@@ -163,6 +164,7 @@ def test_default_factory_uses_auth_manager_token_and_write_settings(monkeypatch,
         "remove_empty_chapter",
         "inspect_mp3_metadata",
         "lookup_recordings",
+        "lookup_lyric_evidence",
         "upload_icon",
         "set_track_icon",
         "reorder_chapters",
@@ -254,6 +256,28 @@ def test_metadata_tools_inspect_bounded_local_file_and_offer_candidates_without_
     assert found.structured_content["result"][0]["id"] == "recording-1"
     assert queries == ["Lenka Everything at Once"]
     assert client.calls == []
+
+
+def test_lyric_evidence_tool_forwards_arguments_and_returns_provider_status(monkeypatch, tmp_path: Path):
+    from yoto_mcp import server as server_module
+
+    calls = []
+    monkeypatch.setattr(
+        server_module, "lookup_lyric_evidence",
+        lambda artist, title, *, album=None, duration_seconds=None: calls.append(
+            (artist, title, album, duration_seconds)
+        ) or {"status": "no_match"},
+    )
+    client = RecordingClient()
+    server = create_server(Settings(upload_root=tmp_path), client_factory=lambda _: client)
+
+    result = asyncio.run(server.call_tool(
+        "lookup_lyric_evidence",
+        {"artist": "Example Artist", "title": "Example Title", "album": "Example Album", "duration_seconds": 180},
+    ))
+    assert isinstance(result, CallToolResult)
+    assert result.structured_content == {"status": "no_match"}
+    assert calls == [("Example Artist", "Example Title", "Example Album", 180)]
 
 
 def test_main_runs_mcp_over_stdio(monkeypatch):

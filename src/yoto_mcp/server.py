@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse, Response
 
 from .auth import AuthManager
 from .config import Settings
+from .lyrics import lookup_lyric_evidence
 from .media import resolve_mp3
 from .metadata import format_track_title, lookup_recordings, read_mp3_tags
 from .yoto import YotoClient
@@ -196,6 +197,15 @@ def create_server(
     @server.tool(name="lookup_recordings", description='Search MusicBrainz candidates only; use query like recording:"Song" AND artist:"Artist" for a precise match. Never auto-select or edit Yoto.')
     def lookup_recordings_tool(query: str) -> list[dict[str, Any]]:
         return lookup_recordings(query)
+
+    @server.tool(
+        name="lookup_lyric_evidence",
+        description="Look up a recording's lyric candidate from LRCLIB (artist+title required; album/duration improve match precision). Text lookup only: no CPU transcription, no cache, no Yoto access. Returns a status, never invents lyrics.",
+    )
+    def lookup_lyric_evidence_tool(
+        artist: str, title: str, album: str | None = None, duration_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        return lookup_lyric_evidence(artist, title, album=album, duration_seconds=duration_seconds)
 
     @server.tool(name="remove_track", description="Remove one exact track key from a playlist.")
     def remove_track(card_id: str, track_key: str, dry_run: bool = True) -> dict[str, Any]:

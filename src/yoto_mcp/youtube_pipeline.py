@@ -491,7 +491,7 @@ class YouTubeCoordinator:
             raise RuntimeError("New audio media did not match the journal")
         self.store.update(
             job_id, audio_status="verified", status="audio_added_icon_pending",
-            stage="icon", resume_from="icon", write_intent=None,
+            stage="icon", resume_from="icon", write_intent=None, diagnostic=None,
         )
 
     @staticmethod
