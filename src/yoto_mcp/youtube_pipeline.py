@@ -98,8 +98,10 @@ class YouTubeCoordinator:
                 )
             if job["status"] == "complete":
                 return job
+            # "failed" is only recorded before a track is reserved, so with no write
+            # journal it is as safe to redo from source as an interrupted source job.
             source_only = (
-                job["status"] in {"queued", "running"}
+                job["status"] in {"queued", "running", "failed"}
                 and job.get("stage") in {"queued", "source"}
                 and job.get("resume_from") == "source"
                 and not any(job.get(field) for field in (
@@ -107,6 +109,10 @@ class YouTubeCoordinator:
                 ))
             )
             if source_only:
+                if job["status"] == "failed":
+                    job = self.store.update(
+                        job_id, status="queued", stage="queued", error=None, diagnostic=None,
+                    )
                 worker = self._run_resume_source
             elif job["dry_run"]:
                 raise ValueError("Preview jobs can resume only before Yoto mutation")

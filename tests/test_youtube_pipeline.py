@@ -220,34 +220,35 @@ def _prepared_without_avatar(video_id, upload_root, avatar_path=None):
     }
 
 
+class AudioOnlyClient:
+    def __init__(self):
+        self.card = {"cardId": "card-one", "content": {"chapters": []}}
+        self.add_calls = 0
+
+    def get_playlist(self, _card_id):
+        return deepcopy(self.card)
+
+    def add_mp3(self, card_id, chapter_key, file_path, *, dry_run, title, on_reserved, on_media_hash,
+                on_failure=None):
+        self.add_calls += 1
+        on_reserved("fresh-track", "fresh-chapter")
+        on_media_hash("m" * 43)
+        self.card["content"]["chapters"].append({"key": "fresh-chapter", "title": title, "tracks": [
+            {"key": "fresh-track", "title": title, "trackUrl": "yoto:#" + "m" * 43},
+        ]})
+        return self.get_playlist(card_id)
+
+    def upload_icon(self, *args, **kwargs):
+        raise AssertionError("no avatar means no icon upload")
+
+    def set_track_icon(self, *args, **kwargs):
+        raise AssertionError("no avatar means no icon assignment")
+
+
 def test_unavailable_avatar_still_adds_verified_audio_and_skips_only_the_icon(tmp_path: Path):
     root = tmp_path / "uploads"
     root.mkdir()
     store = JobStore(tmp_path / "private-jobs")
-
-    class AudioOnlyClient:
-        def __init__(self):
-            self.card = {"cardId": "card-one", "content": {"chapters": []}}
-            self.add_calls = 0
-
-        def get_playlist(self, _card_id):
-            return deepcopy(self.card)
-
-        def add_mp3(self, card_id, chapter_key, file_path, *, dry_run, title, on_reserved, on_media_hash,
-                    on_failure=None):
-            self.add_calls += 1
-            on_reserved("fresh-track", "fresh-chapter")
-            on_media_hash("m" * 43)
-            self.card["content"]["chapters"].append({"key": "fresh-chapter", "title": title, "tracks": [
-                {"key": "fresh-track", "title": title, "trackUrl": "yoto:#" + "m" * 43},
-            ]})
-            return self.get_playlist(card_id)
-
-        def upload_icon(self, *args, **kwargs):
-            raise AssertionError("no avatar means no icon upload")
-
-        def set_track_icon(self, *args, **kwargs):
-            raise AssertionError("no avatar means no icon assignment")
 
     client = AudioOnlyClient()
     coordinator = YouTubeCoordinator(client, store, root, allow_writes=True,
@@ -286,6 +287,69 @@ def test_staged_avatar_that_is_missing_or_escapes_root_still_fails_closed(tmp_pa
     assert failed.get("track_key") is None
     assert failed["diagnostic"]["code"] == "local_preflight_failed"
     assert str(avatar) not in json.dumps(failed)
+    coordinator.close()
+
+
+def _failed_before_upload(store: JobStore) -> dict:
+    """The persisted shape of a job that failed local preflight before any Yoto write."""
+    job = store.submit("card-one", "abcdefghijk", dry_run=False, artist="Video Artist", song_name="Song")
+    return store.update(
+        job["job_id"], status="failed", stage="source", resume_from="source",
+        error="Verified channel avatar unavailable; audio was not uploaded",
+        diagnostic={"code": "local_preflight_failed", "operation": "local_preflight", "attempt": "initial"},
+    )
+
+
+def test_job_that_failed_before_any_yoto_write_can_be_resumed_from_source(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    failed = _failed_before_upload(store)
+    client = AudioOnlyClient()
+    coordinator = YouTubeCoordinator(client, store, root, allow_writes=True,
+                                     prepare=lambda v, r, **_k: _prepared_without_avatar(v, r))
+
+    again = coordinator.submit("card-one", "abcdefghijk", dry_run=False, artist="Video Artist", song_name="Song")
+    assert again["job_id"] == failed["job_id"]  # Admission stays idempotent; resume is the retry.
+    coordinator.resume(failed["job_id"])
+    done = coordinator.wait(failed["job_id"], timeout=3)
+
+    assert done["status"] == "complete" and done["icon_status"] == "skipped_unavailable"
+    assert done["audio_status"] == "verified" and done["track_key"] == "fresh-track"
+    assert done.get("error") is None and done.get("diagnostic") is None
+    assert client.add_calls == 1
+    assert len(store.all_jobs()) == 1
+    coordinator.close()
+
+
+@pytest.mark.parametrize("journal", [{"write_intent": "add_mp3"}, {"track_key": "t"}, {"media_hash": "m" * 43}])
+def test_failed_job_with_any_write_journal_is_not_restarted_from_source(tmp_path: Path, journal: dict):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    failed = _failed_before_upload(store)
+    store.update(failed["job_id"], **journal)
+    coordinator = YouTubeCoordinator(
+        NoYotoWrites(), store, root, allow_writes=True,
+        prepare=lambda *_a, **_k: pytest.fail("must not redo source work after a possible Yoto write"),
+    )
+    with pytest.raises(ValueError, match="safely reconcilable"):
+        coordinator.resume(failed["job_id"])
+    assert store.get(failed["job_id"])["status"] == "failed"
+    coordinator.close()
+
+
+def test_failed_write_job_resume_still_requires_the_write_gate(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    failed = _failed_before_upload(store)
+    coordinator = YouTubeCoordinator(
+        NoYotoWrites(), store, root, allow_writes=False,
+        prepare=lambda *_a, **_k: pytest.fail("write gate must be checked first"),
+    )
+    with pytest.raises(ValueError, match="YOTO_ALLOW_WRITES"):
+        coordinator.resume(failed["job_id"])
     coordinator.close()
 
 

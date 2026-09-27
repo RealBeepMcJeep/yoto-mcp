@@ -148,7 +148,7 @@ def create_server(
             raise ValueError("YOTO_UPLOAD_ROOT and YOTO_JOB_ROOT must be configured")
         return youtube.get(job_id)
 
-    @server.tool(name="resume_youtube_job", description="Reconcile audio, resume a pending icon, explicitly approve a flagged duplicate, or supply a verified icon ID after an uncertain upload. Never blindly re-add audio/icons.")
+    @server.tool(name="resume_youtube_job", description="Retry a job that failed before any Yoto write (add_youtube returns the same job for the same request), reconcile audio, resume a pending icon,explicitly approve a flagged duplicate, or supply a verified icon ID after an uncertain upload. Never blindly re-add audio/icons.")
     def resume_youtube_job(
         job_id: str, approve_duplicate: bool = False, icon_media_id: str | None = None,
     ) -> dict[str, Any]:

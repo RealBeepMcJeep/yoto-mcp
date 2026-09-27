@@ -1,5 +1,9 @@
 # Changelog
 
+## Retry jobs that failed before any Yoto write
+
+- `add_youtube` returns the existing job for an identical request, so a job that failed before upload could not be retried. `resume_youtube_job` now restarts a `failed` job from source when it has no reserved track, chapter, media hash or write intent, clearing its stale error and diagnostic. Failed jobs with any write journal are still refused; the write gate still applies.
+
 ## add_youtube survives an unavailable channel avatar
 
 - If preparation cannot obtain the uploader's channel avatar, `add_youtube` no longer fails before upload. The MP3 is uploaded and its exact track, chapter and media hash verified as before; the job completes with `icon_status: skipped_unavailable` and a sanitized warning giving the reason. A staged avatar that later goes missing or escapes the upload root still fails closed, and icon upload/assignment failures after audio is added remain resumable partial failures.
