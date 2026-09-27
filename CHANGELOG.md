@@ -1,5 +1,9 @@
 # Changelog
 
+## Lyric transcription
+
+- Added `transcribe_lyrics`, backed by a CPU-only whisper.cpp v1.9.4 build in the image (`GGML_NATIVE=OFF` + `GGML_CPU_ALL_VARIANTS` for runtime CPU dispatch) and the multilingual `base` model pinned by SHA-256. Runs with `-sns` (suppress non-speech tokens); without it Whisper labels most sung vocals as music and emits almost no words. Results are cached privately by audio hash + model. The image build proves the binary loads the model. Adds ~155 MB to the image.
+
 ## Lyric evidence lookup and job diagnostic cleanup
 
 - Added read-only `lookup_lyric_evidence` backed by LRCLIB `GET /api/get`: artist/title required, album/duration optional. Returns an explicit status instead of raising on a miss, honors `Retry-After` on 429, identifies the client via `User-Agent`, and never echoes raw provider bodies in errors. No Yoto access, persistence or transcription.

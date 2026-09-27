@@ -16,6 +16,7 @@ from .config import Settings
 from .lyrics import lookup_lyric_evidence
 from .media import resolve_mp3
 from .metadata import format_track_title, lookup_recordings, read_mp3_tags
+from .transcription import transcribe_audio
 from .yoto import YotoClient
 from .youtube_jobs import JobStore
 from .youtube_pipeline import YouTubeCoordinator
@@ -206,6 +207,15 @@ def create_server(
         artist: str, title: str, album: str | None = None, duration_seconds: int | None = None,
     ) -> dict[str, Any]:
         return lookup_lyric_evidence(artist, title, album=album, duration_seconds=duration_seconds)
+
+    @server.tool(
+        name="transcribe_lyrics",
+        description="Transcribe sung words from one local audio file under YOTO_UPLOAD_ROOT (e.g. an export_track result) with CPU whisper.cpp. Blocks until done (can take minutes); cached by audio bytes + model, so repeats are instant unless refresh=true. Reports elapsed_seconds. A transcript is an unreliable second opinion, not ground truth. No Yoto access.",
+    )
+    def transcribe_lyrics(file_path: str, refresh: bool = False) -> dict[str, Any]:
+        if settings.upload_root is None:
+            raise ValueError("YOTO_UPLOAD_ROOT must be configured to transcribe audio")
+        return transcribe_audio(settings.upload_root, file_path, refresh=refresh)
 
     @server.tool(name="remove_track", description="Remove one exact track key from a playlist.")
     def remove_track(card_id: str, track_key: str, dry_run: bool = True) -> dict[str, Any]:

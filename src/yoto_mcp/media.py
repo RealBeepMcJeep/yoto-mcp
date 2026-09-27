@@ -44,6 +44,26 @@ def resolve_image(root: Path, value: str) -> tuple[Path, str]:
     return safe_path, mime
 
 
+def resolve_audio(root: Path, value: str) -> Path:
+    """Resolve any local audio file under root; FFmpeg decoding validates the format."""
+    if not value or not value.strip():
+        raise ValueError("An audio path is required")
+    try:
+        safe_root = root.resolve(strict=True)
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = safe_root / candidate
+        safe_path = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Audio path does not exist") from exc
+    if not safe_path.is_relative_to(safe_root) or not safe_path.is_file():
+        raise ValueError("Audio path must be a file inside YOTO_UPLOAD_ROOT")
+    size = safe_path.stat().st_size
+    if size < 128 or size > MAX_FILE_BYTES:
+        raise ValueError("Audio file is empty, too small, or exceeds 100 MiB")
+    return safe_path
+
+
 def ascii_header_filename(name: str) -> str:
     """Return an ASCII-safe filename for HTTP header values.
 

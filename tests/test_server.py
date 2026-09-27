@@ -78,6 +78,7 @@ def test_server_registers_list_read_add_remove_tools_and_defaults_mutations_to_d
         "inspect_mp3_metadata",
         "lookup_recordings",
         "lookup_lyric_evidence",
+        "transcribe_lyrics",
         "upload_icon",
         "set_track_icon",
         "reorder_chapters",
@@ -165,6 +166,7 @@ def test_default_factory_uses_auth_manager_token_and_write_settings(monkeypatch,
         "inspect_mp3_metadata",
         "lookup_recordings",
         "lookup_lyric_evidence",
+        "transcribe_lyrics",
         "upload_icon",
         "set_track_icon",
         "reorder_chapters",
@@ -278,6 +280,20 @@ def test_lyric_evidence_tool_forwards_arguments_and_returns_provider_status(monk
     assert isinstance(result, CallToolResult)
     assert result.structured_content == {"status": "no_match"}
     assert calls == [("Example Artist", "Example Title", "Example Album", 180)]
+
+
+def test_transcribe_tool_forwards_upload_root_and_refresh(monkeypatch, tmp_path: Path):
+    from yoto_mcp import server as server_module
+
+    calls = []
+    monkeypatch.setattr(
+        server_module, "transcribe_audio",
+        lambda root, path, *, refresh: calls.append((root, path, refresh)) or {"status": "complete", "text": "x"},
+    )
+    server = create_server(Settings(upload_root=tmp_path), client_factory=lambda _: RecordingClient())
+    result = asyncio.run(server.call_tool("transcribe_lyrics", {"file_path": "song.opus", "refresh": True}))
+    assert result.structured_content == {"status": "complete", "text": "x"}
+    assert calls == [(tmp_path, "song.opus", True)]
 
 
 def test_main_runs_mcp_over_stdio(monkeypatch):
