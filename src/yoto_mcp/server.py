@@ -210,12 +210,12 @@ def create_server(
 
     @server.tool(
         name="transcribe_lyrics",
-        description="Transcribe sung words from one local audio file under YOTO_UPLOAD_ROOT (e.g. an export_track result) with CPU whisper.cpp. Blocks until done (can take minutes); cached by audio bytes + model, so repeats are instant unless refresh=true. Reports elapsed_seconds. A transcript is an unreliable second opinion, not ground truth. No Yoto access.",
+        description="Transcribe sung words from one local audio file under YOTO_UPLOAD_ROOT (e.g. an export_track result) with CPU whisper.cpp. Pass language (e.g. 'en', 'es', 'ja') when the song's language is known; otherwise it is detected from clips inside the song. Blocks until done (can take minutes); cached by audio bytes + model + language, so repeats are instant unless refresh=true. Reports elapsed_seconds and the language used. A transcript is an unreliable second opinion, not ground truth. No Yoto access.",
     )
-    def transcribe_lyrics(file_path: str, refresh: bool = False) -> dict[str, Any]:
+    def transcribe_lyrics(file_path: str, language: str | None = None, refresh: bool = False) -> dict[str, Any]:
         if settings.upload_root is None:
             raise ValueError("YOTO_UPLOAD_ROOT must be configured to transcribe audio")
-        return transcribe_audio(settings.upload_root, file_path, refresh=refresh)
+        return transcribe_audio(settings.upload_root, file_path, language=language, refresh=refresh)
 
     @server.tool(name="remove_track", description="Remove one exact track key from a playlist.")
     def remove_track(card_id: str, track_key: str, dry_run: bool = True) -> dict[str, Any]:

@@ -35,13 +35,19 @@ def setup(tmp_path: Path, monkeypatch):
     def runner(args, **kwargs):
         calls.append(args)
         if Path(args[0]).name == "ffmpeg":
-            with open(args[-1], "wb") as wav:
-                wav.truncate(44 + 32000 * runner.seconds)
+            if "-ss" not in args:
+                with open(args[-1], "wb") as wav:
+                    wav.truncate(44 + 32000 * runner.seconds)
             return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if "-dl" in args:
+            lang, p = runner.detections.pop(0) if runner.detections else ("en", 0.9)
+            line = f"whisper_full: auto-detected language: {lang} (p = {p})\n" if lang else "no detection\n"
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr=line)
         return subprocess.CompletedProcess(args, runner.whisper_code, stdout=" placeholder line one\n\n placeholder line two\n", stderr="")
 
     runner.seconds = 120
     runner.whisper_code = 0
+    runner.detections = []
     return root, env, runner, calls, model
 
 
@@ -52,10 +58,11 @@ def test_transcribes_then_serves_repeat_from_private_cache(setup):
     assert first["cache_hit"] is False
     assert first["audio_seconds"] == 120.0
     assert first["threads"] == 2
-    whisper_args = calls[1]
+    whisper_args = calls[-1]
     assert whisper_args[whisper_args.index("-t") + 1] == "2"
-    assert whisper_args[whisper_args.index("-l") + 1] == "auto"
+    assert whisper_args[whisper_args.index("-l") + 1] == "en"
     assert "-sns" in whisper_args
+    assert first["language"] == "en" and first["language_source"] == "detected"
 
     cache_files = list(Path(env["YOTO_TRANSCRIPT_CACHE"]).glob("*.json"))
     assert len(cache_files) == 1
@@ -75,7 +82,7 @@ def test_refresh_and_model_change_bypass_the_cache(setup):
     transcribe_audio(root, "song.opus", env=env, runner=runner)
     calls.clear()
     assert transcribe_audio(root, "song.opus", env=env, runner=runner, refresh=True)["cache_hit"] is False
-    assert len(calls) == 2
+    assert sum("-sns" in c for c in calls) == 1
     model.write_bytes(b"m" * 200)
     assert transcribe_audio(root, "song.opus", env=env, runner=runner)["cache_hit"] is False
 
@@ -110,4 +117,46 @@ def test_paths_outside_upload_root_are_rejected_before_any_subprocess(setup, tmp
     outside.write_bytes(b"x" * 500)
     with pytest.raises(ValueError, match="inside YOTO_UPLOAD_ROOT"):
         transcribe_audio(root, str(outside), env=env, runner=runner)
+    assert calls == []
+
+
+def test_language_vote_sums_probabilities_over_inner_clips(setup):
+    root, env, runner, calls, _ = setup
+    runner.detections = [("ko", 0.6), ("en", 0.5), ("en", 0.4)]
+    result = transcribe_audio(root, "song.opus", env=env, runner=runner)
+    assert result["language"] == "en"
+    clip_starts = [float(c[c.index("-ss") + 1]) for c in calls if "-ss" in c]
+    assert clip_starts == [30.0, 48.0, 66.0]
+
+
+def test_explicit_language_skips_detection_and_is_part_of_the_cache_key(setup):
+    root, env, runner, calls, _ = setup
+    result = transcribe_audio(root, "song.opus", language="es", env=env, runner=runner)
+    assert result["language"] == "es" and result["language_source"] == "requested"
+    assert not any("-dl" in c for c in calls)
+    assert calls[-1][calls[-1].index("-l") + 1] == "es"
+    calls.clear()
+    assert transcribe_audio(root, "song.opus", language="en", env=env, runner=runner)["cache_hit"] is False
+    assert transcribe_audio(root, "song.opus", language="es", env=env, runner=runner)["cache_hit"] is True
+
+
+def test_failed_detection_falls_back_to_whisper_auto(setup):
+    root, env, runner, _, _ = setup
+    runner.detections = [(None, 0)] * 3
+    result = transcribe_audio(root, "song.opus", env=env, runner=runner)
+    assert result["language"] == "auto" and result["language_source"] == "whisper_auto"
+
+
+def test_short_audio_detects_once_from_the_start(setup):
+    root, env, runner, calls, _ = setup
+    runner.seconds = 20
+    transcribe_audio(root, "song.opus", env=env, runner=runner)
+    assert [c[c.index("-ss") + 1] for c in calls if "-ss" in c] == ["0.00"]
+
+
+@pytest.mark.parametrize("language", ["english", "EN", "e", "en;rm", ""])
+def test_invalid_language_is_rejected_before_any_subprocess(setup, language):
+    root, env, runner, calls, _ = setup
+    with pytest.raises(ValueError, match="language"):
+        transcribe_audio(root, "song.opus", language=language, env=env, runner=runner)
     assert calls == []

@@ -288,12 +288,14 @@ def test_transcribe_tool_forwards_upload_root_and_refresh(monkeypatch, tmp_path:
     calls = []
     monkeypatch.setattr(
         server_module, "transcribe_audio",
-        lambda root, path, *, refresh: calls.append((root, path, refresh)) or {"status": "complete", "text": "x"},
+        lambda root, path, *, language, refresh: calls.append((root, path, language, refresh))
+        or {"status": "complete", "text": "x"},
     )
     server = create_server(Settings(upload_root=tmp_path), client_factory=lambda _: RecordingClient())
-    result = asyncio.run(server.call_tool("transcribe_lyrics", {"file_path": "song.opus", "refresh": True}))
+    result = asyncio.run(server.call_tool(
+        "transcribe_lyrics", {"file_path": "song.opus", "language": "en", "refresh": True}))
     assert result.structured_content == {"status": "complete", "text": "x"}
-    assert calls == [(tmp_path, "song.opus", True)]
+    assert calls == [(tmp_path, "song.opus", "en", True)]
 
 
 def test_main_runs_mcp_over_stdio(monkeypatch):

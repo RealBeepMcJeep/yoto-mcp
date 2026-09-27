@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -22,6 +23,15 @@ from .youtube_source import YouTubeSourceError, _completed, _media_binary
 MAX_AUDIO_SECONDS = 3600
 MAX_TRANSCRIPT_BYTES = 1024 * 1024
 DECODE_TIMEOUT = 120
+DETECT_TIMEOUT = 120
+# Whisper detects language from the first 30 s, which in songs is often an intro:
+# it misread some English pop songs as Korean. Voting over clips from inside the
+# song fixed that in local tests, at the cost of three short detection passes.
+DETECT_CLIP_SECONDS = 30
+DETECT_POINTS = (0.25, 0.40, 0.55)
+CACHE_VERSION = "v2"
+_LANGUAGE_RE = re.compile(r"^[a-z]{2,3}$")
+_DETECTED_RE = re.compile(r"auto-detected language: ([a-z]{2,3}) \(p = ([0-9.]+)\)")
 
 
 class TranscriptionError(RuntimeError):
@@ -66,16 +76,38 @@ def _write_private_json(path: Path, record: dict[str, Any]) -> None:
             os.unlink(tmp)
 
 
+def _detect_language(runner: Callable[..., Any], cli: Path, model: Path, wav: Path, duration: float, threads: int) -> str | None:
+    """Sum detection probabilities over clips from inside the song; None if nothing detected."""
+    points = DETECT_POINTS if duration > DETECT_CLIP_SECONDS * 1.5 else (0.0,)
+    votes: dict[str, float] = {}
+    clip = wav.with_name("clip.wav")
+    for point in points:
+        _completed(runner, [
+            _media_binary("ffmpeg"), "-nostdin", "-v", "error", "-y", "-ss", f"{duration * point:.2f}",
+            "-t", str(DETECT_CLIP_SECONDS), "-i", str(wav), "-c", "copy", str(clip),
+        ], timeout=DECODE_TIMEOUT)
+        result = _completed(runner, [
+            str(cli), "-m", str(model), "-f", str(clip), "-t", str(threads), "-dl",
+        ], timeout=DETECT_TIMEOUT)
+        match = _DETECTED_RE.search(result.stderr) or _DETECTED_RE.search(result.stdout)
+        if match:
+            votes[match[1]] = votes.get(match[1], 0.0) + float(match[2])
+    return max(votes, key=votes.__getitem__) if votes else None
+
+
 def transcribe_audio(
     upload_root: Path,
     file_path: str,
     *,
+    language: str | None = None,
     refresh: bool = False,
     env: Mapping[str, str] | None = None,
     runner: Callable[..., Any] = subprocess.run,
 ) -> dict[str, Any]:
-    """Transcribe one audio file under upload_root; cached by audio bytes + model."""
+    """Transcribe one audio file under upload_root; cached by audio bytes + model + language."""
     env = os.environ if env is None else env
+    if language is not None and not _LANGUAGE_RE.fullmatch(language):
+        raise ValueError("language must be a 2-3 letter Whisper code such as 'en', or omitted")
     source = resolve_audio(upload_root, file_path)
     cli = _absolute_file(env, "YOTO_WHISPER_CLI", "/opt/whisper/whisper-cli", "whisper-cli")
     model = _absolute_file(env, "YOTO_WHISPER_MODEL", "/opt/whisper/ggml-base.bin", "Whisper model")
@@ -85,7 +117,7 @@ def transcribe_audio(
     audio_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
     # A model is identified by name + size: cheap, and changes whenever the file is swapped.
     model_id = f"{model.stem}-{model.stat().st_size}"
-    cache_file = _cache_root(env) / f"{audio_sha256}-{model_id}.json"
+    cache_file = _cache_root(env) / f"{audio_sha256}-{model_id}-{language or 'auto'}-{CACHE_VERSION}.json"
     if not refresh and cache_file.is_file():
         try:
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
@@ -108,11 +140,16 @@ def transcribe_audio(
                 raise TranscriptionError("Audio is longer than one hour")
             if duration < 1:
                 raise TranscriptionError("Audio is shorter than one second")
+            if language:
+                used_language, language_source = language, "requested"
+            else:
+                detected = _detect_language(runner, cli, model, wav, duration, threads)
+                used_language, language_source = (detected, "detected") if detected else ("auto", "whisper_auto")
             # -sns suppresses non-speech tokens: without it Whisper labels most sung
             # vocals "[Music]" and emits almost no words (measured 0% -> 68-91% recall).
             result = _completed(runner, [
                 str(cli), "-m", str(model), "-f", str(wav), "-t", str(threads),
-                "-l", "auto", "-nt", "-np", "-sns",
+                "-l", used_language, "-nt", "-np", "-sns",
             ], timeout=timeout, output_limit=MAX_TRANSCRIPT_BYTES)
     except YouTubeSourceError:
         raise TranscriptionError("Audio decode or transcription failed or timed out") from None
@@ -124,6 +161,8 @@ def transcribe_audio(
         "status": "complete",
         "text": text,
         "model": model_id,
+        "language": used_language,
+        "language_source": language_source,
         "audio_sha256": audio_sha256,
         "audio_seconds": round(duration, 1),
         "elapsed_seconds": round(time.monotonic() - started, 1),
