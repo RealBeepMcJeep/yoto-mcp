@@ -1,5 +1,9 @@
 # Changelog
 
+## Remote MP3 upload links
+
+- Added the HTTP-only `create_mp3_upload(filename?)` tool and a `PUT`/`POST /uploads/<secret>` route on the existing port. The authenticated tool mints a single-use link (15 minutes, 100 MiB) built from the Host the client used; the agent sends raw bytes with `curl -T` and no bearer header. Host allowlist, form/oversize/non-MP3 rejection (ffprobe), private `0600` storage under `YOTO_UPLOAD_ROOT/inbox/`, a returned `file_path` for `add_mp3`, and a 24-hour inbox sweep. The container smoke performs a real upload and replay rejection.
+
 ## Cancel YouTube jobs; repeated add_youtube retries pre-write failures
 
 - Added `cancel_youtube_job(job_id)` for jobs with no reserved track, chapter or media hash (queued, preparing, failed, awaiting duplicate review, or a preview). It deletes staged files, and a running worker stops before its card write; the cancel check and the worker's write intent are one serialized job-store update. Refused once a track is reserved.

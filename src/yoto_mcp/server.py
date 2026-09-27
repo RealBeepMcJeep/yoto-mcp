@@ -6,7 +6,7 @@ import hmac
 from collections.abc import Callable
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -14,9 +14,10 @@ from starlette.responses import JSONResponse, Response
 from .auth import AuthManager
 from .config import Settings
 from .lyrics import lookup_lyric_evidence
-from .media import resolve_mp3
+from .media import MAX_FILE_BYTES, resolve_mp3
 from .metadata import format_track_title, lookup_recordings, read_mp3_tags
 from .transcription import transcribe_audio
+from .uploads import LINK_TTL_SECONDS, UploadLinks, upload_url
 from .yoto import YotoClient
 from .youtube_jobs import JobStore
 from .youtube_pipeline import YouTubeCoordinator
@@ -71,8 +72,49 @@ def create_http_app(server: MCPServer, settings: Settings) -> Any:
         host="0.0.0.0",
     )
     app.add_route("/healthz", healthz, methods=["GET"])
+    if settings.upload_root is not None:
+        _add_mp3_upload(server, app, UploadLinks(settings.upload_root), health_security)
     app.add_middleware(BearerAuthMiddleware, token=settings.http_token)
     return app
+
+
+CREATE_MP3_UPLOAD_DESCRIPTION = (
+    "Get a single-use link for sending a local MP3 to this server over HTTP, so add_mp3 can use it. "
+    "Step 1: call this tool (optionally with filename, e.g. 'Artist - Song.mp3'; it becomes the file name "
+    "and the fallback track title). Step 2: from a shell, send the raw file bytes with "
+    "`curl --fail-with-body -T /path/to/song.mp3 '<upload_url>'` (a PUT; POST of the raw body also works, "
+    "form uploads do not). No Authorization header is needed: the link itself is the credential, so never "
+    "share it. It works once and expires in 15 minutes; files up to 100 MiB that ffprobe reads as MP3 are "
+    "accepted. Step 3: the PUT replies with JSON containing file_path, duration and embedded tags; pass "
+    "that file_path to add_mp3 (chapter_key='new', dry_run=true to preview, then dry_run=false). Uploaded "
+    "files not used within 24 hours are deleted. Only available on the HTTP deployment."
+)
+
+
+def _add_mp3_upload(server: MCPServer, app: Any, links: UploadLinks, security: Any) -> None:
+    """Register create_mp3_upload plus its PUT route; HTTP-only, since stdio shares the filesystem."""
+
+    async def receive_upload(request: Request) -> Response:
+        rejected = await security.validate_request(request)
+        return rejected if rejected is not None else await links.receive(request)
+
+    app.add_route("/uploads/{token}", receive_upload, methods=["PUT", "POST"])
+    app.state.upload_links = links
+
+    @server.tool(name="create_mp3_upload", description=CREATE_MP3_UPLOAD_DESCRIPTION)
+    def create_mp3_upload(ctx: Context, filename: str | None = None) -> dict[str, Any]:
+        request = ctx.request_context.request
+        if not isinstance(request, Request):
+            raise TypeError("create_mp3_upload is only available over Streamable HTTP")
+        url = upload_url(request, links.create(filename))
+        return {
+            "upload_url": url,
+            "method": "PUT",
+            "expires_in_seconds": LINK_TTL_SECONDS,
+            "max_bytes": MAX_FILE_BYTES,
+            "command": f"curl --fail-with-body -T /path/to/song.mp3 '{url}'",
+            "then": "Pass the file_path from the upload's JSON reply to add_mp3.",
+        }
 
 
 def run_http_server(server: MCPServer, *, host: str, port: int, settings: Settings) -> None:
@@ -166,7 +208,14 @@ def create_server(
             raise ValueError("YOTO_UPLOAD_ROOT and YOTO_JOB_ROOT must be configured")
         return youtube.cancel(job_id)
 
-    @server.tool(name="add_mp3", description="Upload an MP3 and append it to a playlist chapter.")
+    @server.tool(
+        name="add_mp3",
+        description=(
+            "Upload an MP3 to Yoto and append it to a playlist chapter (chapter_key='new' for its own chapter). "
+            "file_path must be an MP3 already inside this server's YOTO_UPLOAD_ROOT; a remote agent gets one "
+            "there with create_mp3_upload. Defaults to a dry-run preview; dry_run=false writes."
+        ),
+    )
     def add_mp3(
         card_id: str,
         chapter_key: str,
