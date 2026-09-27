@@ -412,18 +412,16 @@ class YouTubeCoordinator:
         fields: dict[str, Any], *, attempt: str = "initial",
     ) -> None:
         try:
-            if not isinstance(prepared.get("avatar_path"), str) or not prepared["avatar_path"]:
-                raise YouTubeSourceError("Verified channel avatar unavailable; audio was not uploaded")
             if not isinstance(prepared.get("mp3_path"), str) or not prepared["mp3_path"]:
                 raise YouTubeSourceError("Verified MP3 unavailable; audio was not uploaded")
             root = self.upload_root.resolve(strict=True)
             mp3 = Path(prepared["mp3_path"]).resolve(strict=True)
-            avatar = Path(prepared["avatar_path"]).resolve(strict=True)
-            if (
-                not mp3.is_file() or not avatar.is_file()
-                or not mp3.is_relative_to(root) or not avatar.is_relative_to(root)
-            ):
+            if not mp3.is_file() or not mp3.is_relative_to(root):
                 raise ValueError("Prepared source files escaped YOTO_UPLOAD_ROOT")
+            # An avatar that preparation could not obtain only costs the icon (_finish_icon
+            # skips it). One that preparation did stage must still exist inside the root.
+            if prepared.get("avatar_path") is not None:
+                self._verified_avatar(prepared["avatar_path"], root)
         except Exception as exc:
             self._record_upload_failure(job_id, "local_preflight", exc, attempt=attempt)
             raise
@@ -511,10 +509,12 @@ class YouTubeCoordinator:
         self._exact_track(card, job["track_key"], job["chapter_key"])
         icon_id = job.get("icon_media_id")
         if not icon_id:
-            avatar = Path(job["avatar_path"]).resolve(strict=True)
-            root = self.upload_root.resolve(strict=True)
-            if not avatar.is_file() or not avatar.is_relative_to(root):
-                raise RuntimeError("Verified avatar is missing")
+            if job.get("avatar_path") is None:
+                warnings = [*(job.get("warnings") or []),
+                            "Channel avatar was unavailable during preparation; the track was added without an icon"]
+                self._complete(job_id, job, icon_status="skipped_unavailable", warnings=warnings)
+                return
+            avatar = self._verified_avatar(job["avatar_path"], self.upload_root.resolve(strict=True))
             self.store.update(job_id, write_intent="upload_icon", icon_status="uploading")
             uploaded = self.client.upload_icon(str(avatar), auto_convert=True, dry_run=False)
             icon_id = uploaded["mediaId"]
@@ -542,10 +542,22 @@ class YouTubeCoordinator:
             or (chapter.get("display") or {}).get("icon16x16") != icon_ref
         ):
             raise RuntimeError("New track/chapter icon was not confirmed by Yoto")
+        self._complete(job_id, job, icon_status="assigned")
+
+    @staticmethod
+    def _verified_avatar(value: Any, root: Path) -> Path:
+        if not isinstance(value, str) or not value:
+            raise ValueError("Prepared channel avatar path is invalid")
+        avatar = Path(value).resolve(strict=True)
+        if not avatar.is_file() or not avatar.is_relative_to(root):
+            raise ValueError("Prepared source files escaped YOTO_UPLOAD_ROOT")
+        return avatar
+
+    def _complete(self, job_id: str, job: dict[str, Any], *, icon_status: str, **extra: Any) -> None:
         self.store.update(
             job_id, status="complete", stage="complete", resume_from="complete",
-            audio_status="verified", icon_status="assigned", remote_verified=True,
-            write_intent=None, error=None,
+            audio_status="verified", icon_status=icon_status, remote_verified=True,
+            write_intent=None, error=None, **extra,
         )
         mp3 = Path(job["mp3_path"]).resolve(strict=False)
         if mp3.is_relative_to(self.upload_root.resolve(strict=True)) and mp3.is_file():

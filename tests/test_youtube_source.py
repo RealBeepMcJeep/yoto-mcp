@@ -464,6 +464,33 @@ def test_explicit_artist_and_song_name_override_fingerprint_and_keep_source(tmp_
     assert result["title_label"] == "Chosen Artist — Chosen Song"
     assert not result["warnings"]
 
+def test_unavailable_avatar_keeps_prepared_audio_and_reports_sanitized_reason(tmp_path: Path, monkeypatch):
+    from yoto_mcp import youtube_source as source
+
+    monkeypatch.setattr(source, "_probe_video", lambda *_: {
+        "id": "abcdefghijk", "title": "Video Artist - Song", "channel": "Test Channel", "channel_id": CHANNEL_ID,
+    })
+
+    def download(_video_id, stage, _runner):
+        path = stage / "source.m4a"
+        path.write_bytes(b"a" * 256)
+        return path
+
+    def avatar(_client, stage, _channel_id, _channel_name):
+        raise YouTubeSourceError("YouTube channel page identity could not be verified")
+
+    monkeypatch.setattr(source, "_download_source_audio", download)
+    monkeypatch.setattr(source, "_encode_mp3", lambda _s, target, *_a: target.write_bytes(b"m" * 256))
+    monkeypatch.setattr(source, "_verify_mp3", lambda *_: None)
+    monkeypatch.setattr(source, "_download_avatar", avatar)
+
+    result = prepare_youtube("abcdefghijk", tmp_path, runner=lambda *_: pytest.fail("unexpected subprocess"))
+    assert result["avatar_path"] is None
+    assert Path(result["mp3_path"]).is_file()
+    warning = next(item for item in result["warnings"] if "avatar" in item.lower())
+    assert "identity could not be verified" in warning and "without an icon" in warning
+    assert "http" not in warning and str(tmp_path) not in warning
+
 def test_partial_explicit_credits_rejected_before_external_calls(tmp_path: Path):
     with pytest.raises(ValueError, match="artist and song_name"):
         prepare_youtube("abcdefghijk", tmp_path, artist="Only Artist")

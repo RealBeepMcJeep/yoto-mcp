@@ -1027,8 +1027,9 @@ def prepare_youtube(
                 _verify_mp3(mp3_path, runner)
             try:
                 avatar_path = _download_avatar(client, stage, channel_id, channel_name)
-            except YouTubeSourceError:
-                warnings.append("Channel avatar unavailable or could not be verified")
+            except YouTubeSourceError as exc:
+                # YouTubeSourceError messages are fixed, sanitized strings: safe to surface.
+                warnings.append(f"Channel avatar unavailable ({exc}); the track will be added without an icon")
     finally:
         client.close()
     result = {

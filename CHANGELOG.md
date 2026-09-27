@@ -1,5 +1,9 @@
 # Changelog
 
+## add_youtube survives an unavailable channel avatar
+
+- If preparation cannot obtain the uploader's channel avatar, `add_youtube` no longer fails before upload. The MP3 is uploaded and its exact track, chapter and media hash verified as before; the job completes with `icon_status: skipped_unavailable` and a sanitized warning giving the reason. A staged avatar that later goes missing or escapes the upload root still fails closed, and icon upload/assignment failures after audio is added remain resumable partial failures.
+
 ## Playlist rename
 
 - Added `rename_playlist(card_id, title, dry_run=true)`: changes only the playlist (card) title, 1-100 printable characters, through the existing whole-card save; requires `YOTO_ALLOW_WRITES=1` plus `dry_run=false`, and confirms the title with a fresh read.
