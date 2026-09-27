@@ -493,6 +493,37 @@ class YotoClient:
             raise YotoAPIError("Yoto did not confirm the track rename")
         return verified
 
+    def rename_playlist(
+        self,
+        card_id: str,
+        title: str,
+        *,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        card_id = self._required_id(card_id, "card id")
+        if not isinstance(title, str):
+            raise TypeError("A playlist title is required")
+        title = title.strip()
+        if not title or len(title) > 100:
+            raise ValueError("Playlist title must be 1–100 characters")
+        if any(ord(char) < 32 or ord(char) == 127 for char in title):
+            raise ValueError("Playlist title cannot contain control characters")
+        is_dry_run = self.dry_run if dry_run is None else dry_run
+        if not is_dry_run:
+            self._require_writes_enabled()
+        card = self._fetch_playlist(card_id, include_pending=False)
+        old_title = card.get("title")
+        if is_dry_run:
+            return {"dry_run": True, "cardId": card_id, "old_title": old_title, "new_title": title}
+        if old_title == title:
+            return card
+        card["title"] = title
+        self._api_json("POST", "/content", json=card)
+        verified = self._fetch_playlist(card_id, include_pending=False)
+        if verified.get("title") != title:
+            raise YotoAPIError("Yoto did not confirm the playlist rename")
+        return verified
+
     def remove_track(
         self,
         card_id: str,

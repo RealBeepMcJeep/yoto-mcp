@@ -30,6 +30,10 @@ class RecordingClient:
         self.calls.append(("rename_track", card_id, track_key, artist, title, dry_run))
         return {"dry_run": dry_run}
 
+    def rename_playlist(self, card_id, title, *, dry_run=True):
+        self.calls.append(("rename_playlist", card_id, title, dry_run))
+        return {"dry_run": dry_run}
+
     def remove_track(self, card_id, track_key, *, dry_run=True):
         self.calls.append(("remove_track", card_id, track_key, dry_run))
         return {"dry_run": dry_run}
@@ -72,6 +76,7 @@ def test_server_registers_list_read_add_remove_tools_and_defaults_mutations_to_d
         "list_playlists",
         "get_playlist",
         "add_mp3",
+        "rename_playlist",
         "rename_track",
         "remove_track",
         "remove_empty_chapter",
@@ -101,6 +106,7 @@ def test_server_registers_list_read_add_remove_tools_and_defaults_mutations_to_d
     )
     asyncio.run(server.call_tool("rename_track", {"card_id": "card-1", "track_key": "track-1",
                                             "artist": "Example Artist", "title": "Example Song"}))
+    asyncio.run(server.call_tool("rename_playlist", {"card_id": "card-1", "title": "Road Trip"}))
     asyncio.run(server.call_tool("remove_track", {"card_id": "card-1", "track_key": "track-1"}))
     asyncio.run(server.call_tool("remove_empty_chapter", {
         "card_id": "card-1", "chapter_key": "chapter-empty", "expected_title": "Empty interlude",
@@ -120,6 +126,7 @@ def test_server_registers_list_read_add_remove_tools_and_defaults_mutations_to_d
         ("get_playlist", "card-1"),
         ("add_mp3", "card-1", "chapter-1", "song.mp3", True, None),
         ("rename_track", "card-1", "track-1", "Example Artist", "Example Song", True),
+        ("rename_playlist", "card-1", "Road Trip", True),
         ("remove_track", "card-1", "track-1", True),
         ("remove_empty_chapter", "card-1", "chapter-empty", "Empty interlude", True),
         ("remove_empty_chapter", "card-1", "chapter-empty", "Empty interlude", False),
@@ -160,6 +167,7 @@ def test_default_factory_uses_auth_manager_token_and_write_settings(monkeypatch,
         "list_playlists",
         "get_playlist",
         "add_mp3",
+        "rename_playlist",
         "rename_track",
         "remove_track",
         "remove_empty_chapter",

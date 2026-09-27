@@ -563,6 +563,47 @@ def test_rename_track_changes_only_exact_track_and_single_song_chapter():
     assert result["unknownCardField"] == CARD["unknownCardField"]
 
 
+def test_rename_playlist_dry_run_previews_without_writing(fake_yoto):
+    requests, transport = fake_yoto
+    client = YotoClient(lambda: "test-token", transport=transport)
+    preview = client.rename_playlist("card-1", "  Road Trip Mix  ")
+    assert preview == {"dry_run": True, "cardId": "card-1", "old_title": CARD["title"], "new_title": "Road Trip Mix"}
+    assert [r.method for r in requests] == ["GET"]
+
+
+def test_rename_playlist_changes_only_the_title_and_verifies_readback():
+    card = copy.deepcopy(CARD)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal card
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/content/card-1":
+            return httpx.Response(200, json={"card": copy.deepcopy(card)}, request=request)
+        if request.method == "POST" and request.url.path == "/content":
+            card = json.loads(request.content)
+            return httpx.Response(200, json={"card": card}, request=request)
+        raise AssertionError("Unexpected request")
+
+    client = YotoClient(lambda: "test-token", transport=httpx.MockTransport(handler), allow_writes=True)
+    result = client.rename_playlist("card-1", "Road Trip Mix", dry_run=False)
+    assert [r.method for r in requests] == ["GET", "POST", "GET"]
+    assert result["title"] == "Road Trip Mix"
+    assert {k: v for k, v in result.items() if k != "title"} == {k: v for k, v in CARD.items() if k != "title"}
+
+
+def test_rename_playlist_rejects_bad_titles_and_disabled_writes_before_network():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not call the network")
+
+    client = YotoClient(lambda: "test-token", transport=httpx.MockTransport(handler))
+    for bad in ("", "   ", "x" * 101, "Bad\x00Title"):
+        with pytest.raises(ValueError):
+            client.rename_playlist("card-1", bad)
+    with pytest.raises(PermissionError):
+        client.rename_playlist("card-1", "Fine", dry_run=False)
+
+
 def test_invalid_transcode_metadata_fails_without_post_or_pending_status(tmp_path):
     upload_root = tmp_path / "uploads"
     upload_root.mkdir()

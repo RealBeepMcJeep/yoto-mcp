@@ -1,5 +1,9 @@
 # Changelog
 
+## Playlist rename
+
+- Added `rename_playlist(card_id, title, dry_run=true)`: changes only the playlist (card) title, 1-100 printable characters, through the existing whole-card save; requires `YOTO_ALLOW_WRITES=1` plus `dry_run=false`, and confirms the title with a fresh read.
+
 ## Lyric transcription
 
 - Added `transcribe_lyrics`, backed by a CPU-only whisper.cpp v1.9.4 build in the image (`GGML_NATIVE=OFF` + `GGML_CPU_ALL_VARIANTS` for runtime CPU dispatch) and the multilingual `base` model pinned by SHA-256. Runs with `-sns` (suppress non-speech tokens); without it Whisper labels most sung vocals as music and emits almost no words. Results are cached privately by audio hash + model. The image build proves the binary loads the model. Adds ~155 MB to the image.

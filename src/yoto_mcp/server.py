@@ -174,6 +174,10 @@ def create_server(
             title=title,
         )
 
+    @server.tool(name="rename_playlist", description="Preview or rename one playlist (its card title, 1-100 characters). Tracks, chapters, and cover are unchanged; verified by a fresh read.")
+    def rename_playlist(card_id: str, title: str, dry_run: bool = True) -> dict[str, Any]:
+        return client.rename_playlist(card_id, title, dry_run=dry_run)
+
     @server.tool(name="rename_track", description="Preview or rename one exact track as Artist — Title; also rename its chapter when it has only one track.")
     def rename_track(
         card_id: str,
