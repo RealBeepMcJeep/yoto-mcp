@@ -1,5 +1,10 @@
 # Changelog
 
+## Cancel YouTube jobs; repeated add_youtube retries pre-write failures
+
+- Added `cancel_youtube_job(job_id)` for jobs with no reserved track, chapter or media hash (queued, preparing, failed, awaiting duplicate review, or a preview). It deletes staged files, and a running worker stops before its card write; the cancel check and the worker's write intent are one serialized job-store update. Refused once a track is reserved.
+- Repeating an identical `add_youtube` request now retries a job that failed before any Yoto write (same job ID, stale error/diagnostic/warnings cleared) and starts a new job in place of a cancelled one; other states still return the existing job. Cancelled jobs are excluded from duplicate review.
+
 ## Retry jobs that failed before any Yoto write
 
 - `add_youtube` returns the existing job for an identical request, so a job that failed before upload could not be retried. `resume_youtube_job` now restarts a `failed` job from source when it has no reserved track, chapter, media hash or write intent, clearing its stale error and diagnostic. Failed jobs with any write journal are still refused; the write gate still applies.

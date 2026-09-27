@@ -127,7 +127,9 @@ def create_server(
         description=(
             "Start a durable background YouTube-to-Yoto job. Defaults to a private download/metadata/avatar "
             "preview without Yoto writes; provide dry_run=false for an authorized upload. Optional "
-            "start_time/end_time select the original source timeline using M:SS[.mmm] or HH:MM:SS[.mmm]."
+            "start_time/end_time select the original source timeline using M:SS[.mmm] or HH:MM:SS[.mmm]. "
+            "Repeating an identical request returns the existing job; a job that failed before any Yoto "
+            "write is retried, and a cancelled one is replaced by a new job."
         ),
     )
     def add_youtube(
@@ -148,7 +150,7 @@ def create_server(
             raise ValueError("YOTO_UPLOAD_ROOT and YOTO_JOB_ROOT must be configured")
         return youtube.get(job_id)
 
-    @server.tool(name="resume_youtube_job", description="Retry a job that failed before any Yoto write (add_youtube returns the same job for the same request), reconcile audio, resume a pending icon,explicitly approve a flagged duplicate, or supply a verified icon ID after an uncertain upload. Never blindly re-add audio/icons.")
+    @server.tool(name="resume_youtube_job", description="Retry a job that failed before any Yoto write, reconcile audio, resume a pending icon, explicitly approve a flagged duplicate, or supply a verified icon ID after an uncertain upload. Never blindly re-add audio/icons.")
     def resume_youtube_job(
         job_id: str, approve_duplicate: bool = False, icon_media_id: str | None = None,
     ) -> dict[str, Any]:
@@ -157,6 +159,12 @@ def create_server(
         return youtube.resume(
             job_id, approve_duplicate=approve_duplicate, icon_media_id=icon_media_id,
         )
+
+    @server.tool(name="cancel_youtube_job", description="Cancel a YouTube job that has not written to Yoto (queued, preparing, failed, awaiting duplicate review, or a preview) and delete its staged files. A running job stops before its Yoto write. Refused once a track was reserved; use resume_youtube_job or remove_track then.")
+    def cancel_youtube_job(job_id: str) -> dict[str, Any]:
+        if youtube is None:
+            raise ValueError("YOTO_UPLOAD_ROOT and YOTO_JOB_ROOT must be configured")
+        return youtube.cancel(job_id)
 
     @server.tool(name="add_mp3", description="Upload an MP3 and append it to a playlist chapter.")
     def add_mp3(

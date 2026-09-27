@@ -309,8 +309,6 @@ def test_job_that_failed_before_any_yoto_write_can_be_resumed_from_source(tmp_pa
     coordinator = YouTubeCoordinator(client, store, root, allow_writes=True,
                                      prepare=lambda v, r, **_k: _prepared_without_avatar(v, r))
 
-    again = coordinator.submit("card-one", "abcdefghijk", dry_run=False, artist="Video Artist", song_name="Song")
-    assert again["job_id"] == failed["job_id"]  # Admission stays idempotent; resume is the retry.
     coordinator.resume(failed["job_id"])
     done = coordinator.wait(failed["job_id"], timeout=3)
 
@@ -322,7 +320,7 @@ def test_job_that_failed_before_any_yoto_write_can_be_resumed_from_source(tmp_pa
     coordinator.close()
 
 
-@pytest.mark.parametrize("journal", [{"write_intent": "add_mp3"}, {"track_key": "t"}, {"media_hash": "m" * 43}])
+@pytest.mark.parametrize("journal", [{"track_key": "t"}, {"chapter_key": "c"}, {"media_hash": "m" * 43}])
 def test_failed_job_with_any_write_journal_is_not_restarted_from_source(tmp_path: Path, journal: dict):
     root = tmp_path / "uploads"
     root.mkdir()
@@ -352,6 +350,142 @@ def test_failed_write_job_resume_still_requires_the_write_gate(tmp_path: Path):
         coordinator.resume(failed["job_id"])
     coordinator.close()
 
+
+
+@pytest.mark.parametrize("write_intent", [None, "add_mp3"])
+def test_repeating_add_youtube_retries_a_job_that_failed_before_any_yoto_write(
+    tmp_path: Path, write_intent: str | None,
+):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    failed = _failed_before_upload(store)
+    # add_mp3 journals the reserved track before any upload or POST, so a finished
+    # job with only a write intent and no reservation never reached Yoto either.
+    store.update(failed["job_id"], write_intent=write_intent, warnings=["stale"])
+    client = AudioOnlyClient()
+    coordinator = YouTubeCoordinator(client, store, root, allow_writes=True,
+                                     prepare=lambda v, r, **_k: _prepared_without_avatar(v, r))
+
+    again = coordinator.submit("card-one", "abcdefghijk", dry_run=False, artist="Video Artist", song_name="Song")
+    assert again["job_id"] == failed["job_id"]
+    assert again["status"] == "queued" and again.get("error") is None and again["warnings"] == []
+    done = coordinator.wait(failed["job_id"], timeout=3)
+    assert done["status"] == "complete" and done["icon_status"] == "skipped_unavailable"
+    assert done.get("diagnostic") is None and "stale" not in done["warnings"]
+    assert client.add_calls == 1
+    assert len(store.all_jobs()) == 1
+    coordinator.close()
+
+
+def test_repeating_add_youtube_after_a_possible_write_returns_the_job_unchanged(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    job = store.submit("card-one", "abcdefghijk", dry_run=False)
+    store.update(job["job_id"], status="audio_uncertain", stage="reconcile", resume_from="reconcile",
+                 track_key="t", chapter_key="c", media_hash="m" * 43)
+    coordinator = YouTubeCoordinator(
+        NoYotoWrites(), store, root, allow_writes=True,
+        prepare=lambda *_a, **_k: pytest.fail("must not redo source work after a possible Yoto write"),
+    )
+    again = coordinator.submit("card-one", "abcdefghijk", dry_run=False)
+    assert again["job_id"] == job["job_id"] and again["status"] == "audio_uncertain"
+    with pytest.raises(ValueError, match="remove_track"):
+        coordinator.cancel(job["job_id"])
+    assert store.get(job["job_id"])["status"] == "audio_uncertain"
+    coordinator.close()
+
+
+@pytest.mark.parametrize("status", ["queued", "failed", "needs_duplicate_review", "preview_complete"])
+def test_cancel_releases_a_job_with_no_yoto_write_and_deletes_staged_files(tmp_path: Path, status: str):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    dry_run = status == "preview_complete"
+    job = store.submit("card-one", "abcdefghijk", dry_run=dry_run)
+    mp3, avatar = root / "song.mp3", root / "avatar.jpg"
+    mp3.write_bytes(b"mp3")
+    avatar.write_bytes(b"jpg")
+    store.update(job["job_id"], status="complete" if dry_run else status,
+                 mp3_path=str(mp3), avatar_path=str(avatar))
+    coordinator = YouTubeCoordinator(NoYotoWrites(), store, root, allow_writes=True,
+                                     prepare=lambda v, r, **_k: {"title_label": "A — B", "warnings": []})
+
+    cancelled = coordinator.cancel(job["job_id"])
+    assert cancelled["status"] == "cancelled"
+    assert not mp3.exists() and not avatar.exists()
+    assert coordinator.cancel(job["job_id"])["status"] == "cancelled"  # Idempotent.
+    with pytest.raises(ValueError, match="cancelled"):
+        coordinator.resume(job["job_id"])
+
+    fresh = coordinator.submit("card-one", "abcdefghijk", dry_run=dry_run)
+    assert fresh["job_id"] != job["job_id"] and fresh["status"] == "queued"
+    coordinator.wait(fresh["job_id"], timeout=3)
+    assert store.get(job["job_id"])["status"] == "cancelled"
+    coordinator.close()
+
+
+def test_cancelled_job_with_different_overrides_no_longer_blocks_a_new_request(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    old = store.submit("card-one", "abcdefghijk", dry_run=True, artist="Old", song_name="Name")
+    coordinator = YouTubeCoordinator(NoYotoWrites(), store, root, allow_writes=False,
+                                     prepare=lambda v, r, **_k: {"title_label": "A — B", "warnings": []})
+    store.update(old["job_id"], status="failed")
+    with pytest.raises(ValueError, match="cancel_youtube_job"):
+        coordinator.submit("card-one", "abcdefghijk", artist="New", song_name="Name")
+    coordinator.cancel(old["job_id"])
+    fresh = coordinator.submit("card-one", "abcdefghijk", artist="New", song_name="Name")
+    assert fresh["job_id"] != old["job_id"]
+    coordinator.wait(fresh["job_id"], timeout=3)
+    coordinator.close()
+
+
+def test_cancel_during_preparation_stops_before_the_yoto_write(tmp_path: Path):
+    import threading
+
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    preparing, release = threading.Event(), threading.Event()
+
+    def prepare(video_id, upload_root, **_kwargs):
+        preparing.set()
+        assert release.wait(3)
+        return _prepared_without_avatar(video_id, upload_root)
+
+    class NoReadsOrWrites(NoYotoWrites):
+        def get_playlist(self, _card_id):
+            return {"cardId": "card-one", "content": {"chapters": []}}
+
+    coordinator = YouTubeCoordinator(NoReadsOrWrites(), store, root, allow_writes=True, prepare=prepare)
+    job = coordinator.submit("card-one", "abcdefghijk", dry_run=False)
+    assert preparing.wait(3)
+    assert coordinator.cancel(job["job_id"])["status"] == "cancelled"
+    release.set()
+    done = coordinator.wait(job["job_id"], timeout=3)
+    assert done["status"] == "cancelled" and done.get("write_intent") is None
+    assert not (root / "song.mp3").exists()  # Files staged after the cancel are discarded too.
+    coordinator.close()
+
+
+def test_cancelled_job_is_not_duplicate_evidence(tmp_path: Path):
+    root = tmp_path / "uploads"
+    root.mkdir()
+    store = JobStore(tmp_path / "private-jobs")
+    other = store.submit("card-one", "zyxwvutsrqp", dry_run=False)
+    store.update(other["job_id"], status="needs_duplicate_review",
+                 metadata={"title_label": "Video Artist — Song"})
+    client = AudioOnlyClient()
+    coordinator = YouTubeCoordinator(client, store, root, allow_writes=True,
+                                     prepare=lambda v, r, **_k: _prepared_without_avatar(v, r))
+    coordinator.cancel(other["job_id"])
+    job = coordinator.submit("card-one", "abcdefghijk", dry_run=False)
+    done = coordinator.wait(job["job_id"], timeout=3)
+    assert done["status"] == "complete" and client.add_calls == 1
+    coordinator.close()
 
 @pytest.mark.parametrize("failure_phase", ["assignment", "upload_timeout"])
 def test_restart_resumes_pending_icon_without_readding_audio(tmp_path: Path, failure_phase: str):

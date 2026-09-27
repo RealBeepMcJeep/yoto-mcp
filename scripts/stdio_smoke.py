@@ -24,7 +24,7 @@ async def smoke() -> None:
         if (
             hello.server_info.name != "yoto-mcp"
             or youtube_tool is None
-            or not {"remove_empty_chapter"} <= tool_names
+            or not {"remove_empty_chapter", "cancel_youtube_job"} <= tool_names
         ):
             raise RuntimeError("Default stdio MCP handshake returned unexpected tools")
         properties = youtube_tool.input_schema.get("properties", {})

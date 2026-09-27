@@ -91,6 +91,7 @@ def test_server_registers_list_read_add_remove_tools_and_defaults_mutations_to_d
         "add_youtube",
         "get_youtube_job",
         "resume_youtube_job",
+        "cancel_youtube_job",
     }
     assert received_settings == [settings]
     chapter_tool = next(tool for tool in tools if tool.name == "remove_empty_chapter")
@@ -182,6 +183,7 @@ def test_default_factory_uses_auth_manager_token_and_write_settings(monkeypatch,
         "add_youtube",
         "get_youtube_job",
         "resume_youtube_job",
+        "cancel_youtube_job",
     }
     assert observed["auth_settings"] is settings
     assert observed["token"] == "injected-token"
@@ -389,6 +391,24 @@ def test_resume_youtube_job_tool_routes_exact_job_id(tmp_path: Path):
     }
     assert seen == [("job-one", True, "known-icon")]
 
+
+
+def test_cancel_youtube_job_tool_routes_exact_job_id(tmp_path: Path):
+    seen = []
+
+    class FakeYouTube:
+        def cancel(self, job_id):
+            seen.append(job_id)
+            return {"job_id": job_id, "status": "cancelled"}
+
+    server = create_server(
+        Settings(upload_root=tmp_path / "uploads", job_root=tmp_path / "jobs"),
+        client_factory=lambda _: RecordingClient(),
+        youtube_factory=lambda _client, _settings: FakeYouTube(),
+    )
+    result = asyncio.run(server.call_tool("cancel_youtube_job", {"job_id": "job-one"}))
+    assert result.structured_content == {"job_id": "job-one", "status": "cancelled"}
+    assert seen == ["job-one"]
 
 def test_get_youtube_job_returns_persisted_safe_diagnostic(tmp_path: Path):
     diagnostic = {

@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 
 from .yoto import YotoAPIError
-from .youtube_jobs import JobStore
+from .youtube_jobs import REQUEUE_FIELDS, JobStore, nothing_written
 from .youtube_source import YouTubeSourceError, parse_youtube_id, prepare_youtube
 
 _DIAGNOSTIC_DETAILS = {
@@ -62,7 +62,8 @@ class YouTubeCoordinator:
                 card_id, video_id, dry_run, artist=artist, song_name=song_name,
                 start_time=start_time, end_time=end_time,
             )
-            if job["status"] == "queued" and job["job_id"] not in self._futures:
+            future = self._futures.get(job["job_id"])
+            if job["status"] == "queued" and (future is None or future.done()):
                 self._futures[job["job_id"]] = self._pool.submit(self._run, job)
         return job
 
@@ -98,21 +99,18 @@ class YouTubeCoordinator:
                 )
             if job["status"] == "complete":
                 return job
-            # "failed" is only recorded before a track is reserved, so with no write
-            # journal it is as safe to redo from source as an interrupted source job.
-            source_only = (
-                job["status"] in {"queued", "running", "failed"}
+            if job["status"] == "cancelled":
+                raise ValueError("Job was cancelled; call add_youtube again to start a new job")
+            retry_failed = job["status"] == "failed" and nothing_written(job)
+            source_only = retry_failed or (
+                job["status"] in {"queued", "running"}
                 and job.get("stage") in {"queued", "source"}
                 and job.get("resume_from") == "source"
-                and not any(job.get(field) for field in (
-                    "track_key", "chapter_key", "media_hash", "write_intent",
-                ))
+                and nothing_written(job)
             )
             if source_only:
-                if job["status"] == "failed":
-                    job = self.store.update(
-                        job_id, status="queued", stage="queued", error=None, diagnostic=None,
-                    )
+                if retry_failed:
+                    job = self.store.update(job_id, **REQUEUE_FIELDS)
                 worker = self._run_resume_source
             elif job["dry_run"]:
                 raise ValueError("Preview jobs can resume only before Yoto mutation")
@@ -143,6 +141,34 @@ class YouTubeCoordinator:
             if future is None or future.done():
                 self._futures[job_id] = self._pool.submit(worker, job_id)
             return job
+
+    def cancel(self, job_id: str) -> dict[str, Any]:
+        """Cancel a job that has not written to Yoto; a running worker stops at its next step."""
+        cancelled = self.store.update_if(
+            job_id, nothing_written,
+            status="cancelled", stage="cancelled", resume_from="cancelled", write_intent=None,
+        )
+        if cancelled is None:
+            raise ValueError(
+                "Job may already have written to Yoto (a track was reserved), so it cannot be "
+                "cancelled; use resume_youtube_job to reconcile it or remove_track to remove it"
+            )
+        self._discard_staged(cancelled)
+        return cancelled
+
+    def _unless_cancelled(self, job_id: str, **fields: Any) -> dict[str, Any] | None:
+        return self.store.update_if(job_id, lambda job: job["status"] != "cancelled", **fields)
+
+    def _discard_staged(
+        self, job: dict[str, Any], fields: tuple[str, ...] = ("mp3_path", "avatar_path"),
+    ) -> None:
+        root = self.upload_root.resolve(strict=True)
+        for field in fields:
+            if not isinstance(job.get(field), str) or not job[field]:
+                continue
+            path = Path(job[field]).resolve(strict=False)
+            if path.is_relative_to(root) and path.is_file():
+                path.unlink()
 
     def wait(self, job_id: str, timeout: float = 60) -> dict[str, Any]:
         with self._lock:
@@ -244,7 +270,8 @@ class YouTubeCoordinator:
     def _run(self, job: dict[str, Any], *, attempt: str = "initial") -> None:
         job_id = job["job_id"]
         try:
-            self.store.update(job_id, status="running", stage="source")
+            if self._unless_cancelled(job_id, status="running", stage="source") is None:
+                return
             prepare_kwargs: dict[str, Any] = {
                 "artist": job.get("artist"), "song_name": job.get("song_name"),
             }
@@ -269,15 +296,16 @@ class YouTubeCoordinator:
                 "avatar_path": prepared.get("avatar_path"),
             }
             if job["dry_run"]:
-                self.store.update(
+                if self._unless_cancelled(
                     job_id, **fields, status="complete", stage="preview",
                     audio_status="not_uploaded", icon_status="not_uploaded",
                     remote_verified=False,
-                )
+                ) is None:
+                    self._discard_staged(prepared)
             else:
                 self._publish(job_id, job, prepared, fields, attempt=attempt)
         except YouTubeSourceError as exc:
-            self.store.update(job_id, status="failed", stage="source", error=str(exc))
+            self._unless_cancelled(job_id, status="failed", stage="source", error=str(exc))
         except Exception:  # noqa: BLE001 - upstream exceptions may contain credentials or signed URLs
             self._handle_write_error(job_id, job)
 
@@ -310,7 +338,7 @@ class YouTubeCoordinator:
                 resume_from="reconcile", error="Audio write outcome is uncertain; no automatic retry",
             )
         else:
-            self.store.update(job_id, status="failed", stage="source", error="YouTube job failed")
+            self._unless_cancelled(job_id, status="failed", stage="source", error="YouTube job failed")
 
     def _record_upload_failure(
         self, job_id: str, operation: str, exc: Exception, *, attempt: str,
@@ -377,6 +405,7 @@ class YouTubeCoordinator:
             other for other in self.store.all_jobs()
             if other["card_id"] == job["card_id"]
             and not other["dry_run"]
+            and other["status"] != "cancelled"
             and other["job_id"] != job["job_id"]
             and (
                 other["video_id"] != job["video_id"]
@@ -444,18 +473,22 @@ class YouTubeCoordinator:
                 or existing_tracks != job.get("duplicate_existing_track_keys", [])
             )
             if review_changed or ((other_videos or existing_tracks) and not job.get("duplicate_approved")):
-                self.store.update(
+                if self._unless_cancelled(
                     job_id, **fields, status="needs_duplicate_review", stage="duplicate_review",
                     resume_from="duplicate", duplicate_sources=other_videos,
                     duplicate_source_intervals=other_intervals,
                     duplicate_existing_track_keys=existing_tracks, duplicate_approved=False,
                     write_intent=None,
-                )
+                ) is None:
+                    self._discard_staged(prepared)
                 return
-            self.store.update(
+            # The last point a cancel can land: once write_intent is set, cancel refuses.
+            if self._unless_cancelled(
                 job_id, **fields, stage="audio", status="running", resume_from="audio",
                 write_intent="add_mp3",
-            )
+            ) is None:
+                self._discard_staged(prepared)
+                return
 
             def reserved(track_key: str, chapter_key: str) -> None:
                 self.store.update(job_id, track_key=track_key, chapter_key=chapter_key)
@@ -565,6 +598,4 @@ class YouTubeCoordinator:
             audio_status="verified", icon_status=icon_status, remote_verified=True,
             write_intent=None, error=None, **extra,
         )
-        mp3 = Path(job["mp3_path"]).resolve(strict=False)
-        if mp3.is_relative_to(self.upload_root.resolve(strict=True)) and mp3.is_file():
-            mp3.unlink()
+        self._discard_staged(job, ("mp3_path",))

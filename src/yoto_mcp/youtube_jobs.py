@@ -10,7 +10,7 @@ import re
 import stat
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,8 +50,25 @@ _MUTABLE_FIELDS = frozenset(
     }
 )
 _TERMINAL_STATUSES = frozenset({"complete", "completed", "succeeded", "cancelled"})
+# Resetting a job that never wrote to Yoto so its worker redoes it from source.
+REQUEUE_FIELDS: dict[str, Any] = {
+    "status": "queued", "stage": "queued", "resume_from": "source",
+    "error": None, "diagnostic": None, "write_intent": None, "warnings": [],
+}
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def nothing_written(job: dict[str, Any]) -> bool:
+    """True when this job cannot have changed a Yoto card.
+
+    ``add_mp3`` journals the reserved track before any upload or card POST, so a
+    job without one never reached Yoto. A job that may still be running also needs
+    no pending write intent: its reservation could be moments away.
+    """
+    if any(job.get(field) for field in ("track_key", "chapter_key", "media_hash")):
+        return False
+    return job.get("status") in {"failed", "cancelled"} or not job.get("write_intent")
 
 
 class JobStoreError(RuntimeError):
@@ -112,9 +129,16 @@ class JobStore:
                     and existing["video_id"] == video_id
                     and existing["dry_run"] is dry_run
                     and (existing.get("start_ms"), existing.get("end_ms")) == (start_ms, end_ms)
+                    and existing["status"] != "cancelled"
                 ):
                     if (existing.get("artist"), existing.get("song_name")) != (artist, song_name):
-                        raise ValueError("Existing job has different artist/song_name overrides")
+                        raise ValueError(
+                            "Existing job has different artist/song_name overrides; "
+                            "cancel_youtube_job can release it if nothing was written to Yoto"
+                        )
+                    if existing["status"] == "failed" and nothing_written(existing):
+                        existing.update(copy.deepcopy(REQUEUE_FIELDS), updated_at=self._now())
+                        self._write_job(existing)
                     return existing
 
             now = self._now()
@@ -146,6 +170,18 @@ class JobStore:
 
     def update(self, job_id: str, **fields: Any) -> dict[str, Any]:
         """Atomically persist mutable state fields and return the updated job."""
+        updated = self.update_if(job_id, lambda _job: True, **fields)
+        assert updated is not None
+        return updated
+
+    def update_if(
+        self, job_id: str, condition: Callable[[dict[str, Any]], bool], **fields: Any,
+    ) -> dict[str, Any] | None:
+        """Like ``update``, but only when ``condition(current_job)`` holds; else ``None``.
+
+        The check and write are one serialized step, so a cancel and a worker's
+        write intent cannot interleave.
+        """
         job_id = self._validate_job_id(job_id)
         if not fields:
             raise ValueError("At least one job field must be updated")
@@ -159,6 +195,8 @@ class JobStore:
 
         with self._serialized():
             job = self._read_job(job_id)
+            if not condition(job):
+                return None
             job.update(copy.deepcopy(fields))
             job["updated_at"] = self._now()
             self._write_job(job)
