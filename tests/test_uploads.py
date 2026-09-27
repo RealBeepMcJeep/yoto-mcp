@@ -26,6 +26,10 @@ TINY_MP3 = base64.b64decode(
 )
 
 
+# 1x1 PNG.
+TINY_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+
+
 def _fake_probe(path: Path) -> float:
     if path.read_bytes() != TINY_MP3:
         raise UploadRejected("File is not a readable MP3")
@@ -79,9 +83,12 @@ def test_create_mp3_upload_link_accepts_one_mp3_put_that_add_mp3_can_use(tmp_pat
             ):
                 await session.initialize()
                 tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                created = await session.call_tool("create_mp3_upload", {"filename": "Some Artist - Some Song.mp3"})
-            assert "curl" in tools["create_mp3_upload"].description
-            assert "create_mp3_upload" in tools["add_mp3"].description
+                created = await session.call_tool("create_upload", {"filename": "Some Artist - Some Song.mp3"})
+                legacy = await session.call_tool("create_mp3_upload", {})
+            assert "curl" in tools["create_upload"].description
+            assert "create_upload" in tools["add_mp3"].description
+            assert "create_upload" in tools["upload_icon"].description
+            assert legacy.structured_content["upload_url"].startswith(f"http://127.0.0.1:{port}/uploads/")
             link = created.structured_content
             assert link["upload_url"].startswith(f"http://127.0.0.1:{port}/uploads/")
             assert link["expires_in_seconds"] == LINK_TTL_SECONDS
@@ -101,6 +108,7 @@ def test_create_mp3_upload_link_accepts_one_mp3_put_that_add_mp3_can_use(tmp_pat
 
     assert first.status_code == 201
     body = first.json()
+    assert body["kind"] == "mp3"
     assert body["file_path"].startswith("inbox/") and body["file_path"].endswith("/Some Artist - Some Song.mp3")
     assert body["size_bytes"] == len(TINY_MP3) and body["duration_seconds"] == 0.5
     assert body["suggested_title"] == "Some Artist - Some Song"
@@ -147,6 +155,33 @@ def test_upload_link_rules(upload_app):
     assert len(stored) == 1  # Only the accepted upload remains; rejected ones are removed.
 
 
+def test_upload_link_accepts_icon_images_for_upload_icon(upload_app, monkeypatch):
+    from yoto_mcp.media import resolve_image
+
+    app, root = upload_app
+    links = app.state.upload_links
+    jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 200
+    with TestClient(app, base_url="http://localhost") as http:
+        png = http.put(f"/uploads/{links.create('channel avatar.png')}", content=TINY_PNG)
+        # The type comes from the bytes, not the requested name.
+        misnamed = http.put(f"/uploads/{links.create('avatar.png')}", content=jpeg)
+        default_name = http.put(f"/uploads/{links.create()}", content=TINY_PNG)
+        monkeypatch.setattr(uploads, "MAX_IMAGE_BYTES", 100)
+        too_big = http.put(f"/uploads/{links.create()}", content=TINY_PNG + b"\x00" * 100)
+
+    assert png.status_code == 201
+    body = png.json()
+    assert body["kind"] == "image" and body["content_type"] == "image/png"
+    assert body["file_path"].endswith("/channel avatar.png") and body["size_bytes"] == len(TINY_PNG)
+    assert "upload_icon" in body["next_step"] and "set_track_icon" in body["next_step"]
+    assert resolve_image(root, body["file_path"])[1] == "image/png"  # upload_icon's own check accepts it.
+    assert (root / body["file_path"]).stat().st_mode & 0o777 == 0o600
+    assert misnamed.status_code == 201 and misnamed.json()["file_path"].endswith("/avatar.jpg")
+    assert misnamed.json()["content_type"] == "image/jpeg"
+    assert default_name.json()["file_path"].endswith("/upload.png")
+    assert too_big.status_code == 413 and "10 MiB" in too_big.json()["error"]
+
+
 def test_new_link_sweeps_inbox_uploads_older_than_a_day(upload_app):
     app, root = upload_app
     links = app.state.upload_links
@@ -166,7 +201,7 @@ def test_upload_tool_is_http_only(tmp_path: Path):
 
     settings = Settings(upload_root=tmp_path)
     tools = asyncio.run(create_server(settings, client_factory=lambda _: object()).list_tools())
-    assert "create_mp3_upload" not in {tool.name for tool in tools}
+    assert not {"create_upload", "create_mp3_upload"} & {tool.name for tool in tools}
 
 
 def test_real_ffprobe_accepts_the_fixture_and_rejects_junk(tmp_path: Path):

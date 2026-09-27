@@ -1,11 +1,12 @@
-"""Single-use MP3 upload links for the Streamable HTTP deployment.
+"""Single-use file upload links for the Streamable HTTP deployment.
 
-An authenticated MCP call (``create_mp3_upload``) mints a link; the agent then
-sends the raw MP3 bytes to it with a plain HTTP PUT (e.g. ``curl -T``). The
-random secret in the link is the only credential the PUT needs, so the server's
-bearer token never has to appear in a shell command or transcript. A link works
-once, expires after ``LINK_TTL_SECONDS``, and only stores a verified MP3 under
-``YOTO_UPLOAD_ROOT/inbox``; adding it to a playlist is still ``add_mp3``.
+An authenticated MCP call (``create_upload``) mints a link; the agent then sends
+the raw file bytes to it with a plain HTTP PUT (e.g. ``curl -T``). The random
+secret in the link is the only credential the PUT needs, so the server's bearer
+token never has to appear in a shell command or transcript. A link works once,
+expires after ``LINK_TTL_SECONDS``, and stores one verified MP3 or PNG/JPEG/GIF
+(detected from its bytes) under ``YOTO_UPLOAD_ROOT/inbox``. Using it is still
+``add_mp3`` or ``upload_icon``.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from .media import MAX_FILE_BYTES, sanitize_filename_stem
+from .media import _IMAGE_SIGNATURES, MAX_FILE_BYTES, MAX_IMAGE_BYTES, sanitize_filename_stem
 from .metadata import MetadataLookupError, format_track_title, read_mp3_tags
 from .youtube_source import _media_binary, _run_capture
 
@@ -34,10 +35,11 @@ LINK_TTL_SECONDS = 15 * 60
 INBOX_RETENTION_SECONDS = 24 * 60 * 60
 INBOX = "inbox"
 _PROBE_TIMEOUT_SECONDS = 60
+_IMAGE_SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif"}
 
 
 class UploadRejected(ValueError):
-    """The uploaded bytes are not an acceptable MP3; ``status`` is the HTTP reply code."""
+    """The uploaded bytes are not an acceptable MP3 or image; ``status`` is the HTTP reply code."""
 
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
@@ -119,30 +121,45 @@ class UploadLinks:
     async def receive(self, request: Request) -> Response:
         link = self._claim(request.path_params.get("token", ""))
         if link is None:
-            return _error(404, "Upload link is invalid, expired, or already used; call create_mp3_upload for a new one")
+            return _error(404, "Upload link is invalid, expired, or already used; call create_upload for a new one")
         if request.headers.get("content-type", "").startswith("multipart/"):
-            return _error(415, "Send the raw MP3 bytes as the request body (curl -T file.mp3 URL), not a form upload")
+            return _error(415, "Send the raw file bytes as the request body (curl -T FILE URL), not a form upload")
         declared = request.headers.get("content-length")
         if declared is not None and declared.isdigit() and int(declared) > MAX_FILE_BYTES:
-            return _error(413, "MP3 exceeds the 100 MiB limit")
+            return _error(413, "Upload exceeds the 100 MiB limit")
 
         inbox = self.upload_root / INBOX
         inbox.mkdir(mode=0o700, exist_ok=True)
         folder = inbox / secrets.token_hex(8)
         folder.mkdir(mode=0o700)
-        target = folder / f"{link.stem}.mp3"
+        partial = folder / ".partial"
         try:
             size = 0
-            with target.open("xb") as handle:
+            with partial.open("xb") as handle:
                 async for chunk in request.stream():
                     size += len(chunk)
                     if size > MAX_FILE_BYTES:
-                        raise UploadRejected("MP3 exceeds the 100 MiB limit", 413)
+                        raise UploadRejected("Upload exceeds the 100 MiB limit", 413)
                     handle.write(chunk)
+            partial.chmod(0o600)
+            with partial.open("rb") as handle:
+                header = handle.read(8)
+            mime = next((kind for sig, kind in _IMAGE_SIGNATURES.items() if header.startswith(sig)), None)
+            if mime is not None:
+                if size > MAX_IMAGE_BYTES:
+                    raise UploadRejected("Image exceeds the 10 MiB limit", 413)
+                target = folder / f"{link.stem}{_IMAGE_SUFFIXES[mime]}"
+                partial.rename(target)
+                return self._reply(target, size, kind="image", content_type=mime, next_step=(
+                    f"Call upload_icon(file_path='{target.relative_to(self.upload_root).as_posix()}', "
+                    "dry_run=false) to get a mediaId, then set_track_icon(card_id=..., track_key=..., "
+                    "media_id=<mediaId>) with dry_run=true to preview and dry_run=false to apply."
+                ))
             if size < 128:
-                raise UploadRejected("Upload is empty or too small to be an MP3")
-            target.chmod(0o600)
-            duration = await run_in_threadpool(self.probe, target)
+                raise UploadRejected("Upload is empty or too small to be an MP3 or image")
+            duration = await run_in_threadpool(self.probe, partial)
+            target = folder / f"{link.stem}.mp3"
+            partial.rename(target)
             tags = await run_in_threadpool(_tags, target)
         except UploadRejected as exc:
             shutil.rmtree(folder, ignore_errors=True)
@@ -153,17 +170,20 @@ class UploadLinks:
         file_path = target.relative_to(self.upload_root).as_posix()
         suggested = (format_track_title(tags["artist"], tags["title"])
                      if tags.get("artist") and tags.get("title") else tags.get("title") or link.stem)
-        return JSONResponse({
-            "file_path": file_path,
-            "size_bytes": size,
-            "duration_seconds": round(duration, 3),
-            "tags": tags,
-            "suggested_title": suggested,
-            "expires_in_hours": INBOX_RETENTION_SECONDS // 3600,
-            "next_step": (
+        return self._reply(
+            target, size, kind="mp3", duration_seconds=round(duration, 3), tags=tags,
+            suggested_title=suggested, next_step=(
                 f"Call add_mp3(card_id=..., chapter_key='new', file_path='{file_path}', title=...) "
                 "with dry_run=true to preview, then dry_run=false to add it."
             ),
+        )
+
+    def _reply(self, target: Path, size: int, **fields: Any) -> Response:
+        return JSONResponse({
+            "file_path": target.relative_to(self.upload_root).as_posix(),
+            "size_bytes": size,
+            **fields,
+            "expires_in_hours": INBOX_RETENTION_SECONDS // 3600,
         }, status_code=201)
 
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## Icon images through upload links
+
+- Upload links now also accept PNG/JPEG/GIF icon images, up to 10 MiB, for `upload_icon`. The type is detected from the bytes and stored with the matching extension; the reply adds `kind` and a type-specific `next_step`. The tool is now `create_upload`, with `create_mp3_upload` kept as an alias.
+
 ## Remote MP3 upload links
 
 - Added the HTTP-only `create_mp3_upload(filename?)` tool and a `PUT`/`POST /uploads/<secret>` route on the existing port. The authenticated tool mints a single-use link (15 minutes, 100 MiB) built from the Host the client used; the agent sends raw bytes with `curl -T` and no bearer header. Host allowlist, form/oversize/non-MP3 rejection (ffprobe), private `0600` storage under `YOTO_UPLOAD_ROOT/inbox/`, a returned `file_path` for `add_mp3`, and a 24-hour inbox sweep. The container smoke performs a real upload and replay rejection.

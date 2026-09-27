@@ -14,7 +14,7 @@ from starlette.responses import JSONResponse, Response
 from .auth import AuthManager
 from .config import Settings
 from .lyrics import lookup_lyric_evidence
-from .media import MAX_FILE_BYTES, resolve_mp3
+from .media import MAX_FILE_BYTES, MAX_IMAGE_BYTES, resolve_mp3
 from .metadata import format_track_title, lookup_recordings, read_mp3_tags
 from .transcription import transcribe_audio
 from .uploads import LINK_TTL_SECONDS, UploadLinks, upload_url
@@ -73,26 +73,28 @@ def create_http_app(server: MCPServer, settings: Settings) -> Any:
     )
     app.add_route("/healthz", healthz, methods=["GET"])
     if settings.upload_root is not None:
-        _add_mp3_upload(server, app, UploadLinks(settings.upload_root), health_security)
+        _add_uploads(server, app, UploadLinks(settings.upload_root), health_security)
     app.add_middleware(BearerAuthMiddleware, token=settings.http_token)
     return app
 
 
-CREATE_MP3_UPLOAD_DESCRIPTION = (
-    "Get a single-use link for sending a local MP3 to this server over HTTP, so add_mp3 can use it. "
-    "Step 1: call this tool (optionally with filename, e.g. 'Artist - Song.mp3'; it becomes the file name "
-    "and the fallback track title). Step 2: from a shell, send the raw file bytes with "
-    "`curl --fail-with-body -T /path/to/song.mp3 '<upload_url>'` (a PUT; POST of the raw body also works, "
-    "form uploads do not). No Authorization header is needed: the link itself is the credential, so never "
-    "share it. It works once and expires in 15 minutes; files up to 100 MiB that ffprobe reads as MP3 are "
-    "accepted. Step 3: the PUT replies with JSON containing file_path, duration and embedded tags; pass "
-    "that file_path to add_mp3 (chapter_key='new', dry_run=true to preview, then dry_run=false). Uploaded "
-    "files not used within 24 hours are deleted. Only available on the HTTP deployment."
+CREATE_UPLOAD_DESCRIPTION = (
+    "Get a single-use link for sending one local file to this server over HTTP: an MP3 for add_mp3, or a "
+    "PNG/JPEG/GIF image for upload_icon (the type is detected from the file's bytes). Step 1: call this tool, "
+    "optionally with filename (e.g. 'Artist - Song.mp3' or 'channel-avatar.jpg'; its stem becomes the stored "
+    "name, and for MP3s the fallback track title). Step 2: from a shell, send the raw bytes with "
+    "`curl --fail-with-body -T /path/to/file '<upload_url>'` (a PUT; POST of the raw body also works, form "
+    "uploads do not). No Authorization header is needed: the link itself is the credential, so never share it. "
+    "It works once, even if the upload is rejected, and expires in 15 minutes. Limits: MP3 up to 100 MiB that "
+    "ffprobe reads as MP3; images up to 10 MiB. Step 3: the reply is JSON with file_path, kind ('mp3' or "
+    "'image') and next_step. MP3: pass file_path to add_mp3 (chapter_key='new'). Image: pass file_path to "
+    "upload_icon(dry_run=false) for a mediaId, then set_track_icon; Yoto resizes images itself, so no "
+    "downscaling is needed. Uploads unused after 24 hours are deleted. Only available on the HTTP deployment."
 )
 
 
-def _add_mp3_upload(server: MCPServer, app: Any, links: UploadLinks, security: Any) -> None:
-    """Register create_mp3_upload plus its PUT route; HTTP-only, since stdio shares the filesystem."""
+def _add_uploads(server: MCPServer, app: Any, links: UploadLinks, security: Any) -> None:
+    """Register create_upload (plus its old name) and the PUT route; HTTP-only, since stdio shares the filesystem."""
 
     async def receive_upload(request: Request) -> Response:
         rejected = await security.validate_request(request)
@@ -101,20 +103,25 @@ def _add_mp3_upload(server: MCPServer, app: Any, links: UploadLinks, security: A
     app.add_route("/uploads/{token}", receive_upload, methods=["PUT", "POST"])
     app.state.upload_links = links
 
-    @server.tool(name="create_mp3_upload", description=CREATE_MP3_UPLOAD_DESCRIPTION)
-    def create_mp3_upload(ctx: Context, filename: str | None = None) -> dict[str, Any]:
+    def create_upload(ctx: Context, filename: str | None = None) -> dict[str, Any]:
         request = ctx.request_context.request
         if not isinstance(request, Request):
-            raise TypeError("create_mp3_upload is only available over Streamable HTTP")
+            raise TypeError("create_upload is only available over Streamable HTTP")
         url = upload_url(request, links.create(filename))
         return {
             "upload_url": url,
             "method": "PUT",
             "expires_in_seconds": LINK_TTL_SECONDS,
-            "max_bytes": MAX_FILE_BYTES,
-            "command": f"curl --fail-with-body -T /path/to/song.mp3 '{url}'",
-            "then": "Pass the file_path from the upload's JSON reply to add_mp3.",
+            "max_bytes": {"mp3": MAX_FILE_BYTES, "image": MAX_IMAGE_BYTES},
+            "command": f"curl --fail-with-body -T /path/to/file '{url}'",
+            "then": "Use the file_path from the upload's JSON reply with add_mp3 (MP3) or upload_icon (image).",
         }
+
+    server.tool(name="create_upload", description=CREATE_UPLOAD_DESCRIPTION)(create_upload)
+    server.tool(
+        name="create_mp3_upload",
+        description="Same as create_upload (older name, kept for existing instructions); prefer create_upload.",
+    )(create_upload)
 
 
 def run_http_server(server: MCPServer, *, host: str, port: int, settings: Settings) -> None:
@@ -213,7 +220,7 @@ def create_server(
         description=(
             "Upload an MP3 to Yoto and append it to a playlist chapter (chapter_key='new' for its own chapter). "
             "file_path must be an MP3 already inside this server's YOTO_UPLOAD_ROOT; a remote agent gets one "
-            "there with create_mp3_upload. Defaults to a dry-run preview; dry_run=false writes."
+            "there with create_upload. Defaults to a dry-run preview; dry_run=false writes."
         ),
     )
     def add_mp3(
@@ -298,7 +305,7 @@ def create_server(
 
     @server.tool(
         name="upload_icon",
-        description="Upload a local PNG/JPEG/GIF under YOTO_UPLOAD_ROOT as a Yoto custom icon; returns a mediaId for set_track_icon. Does not assign it to anything.",
+        description="Upload a PNG/JPEG/GIF under YOTO_UPLOAD_ROOT as a Yoto custom icon (auto_convert resizes it); returns a mediaId for set_track_icon. Does not assign it to anything. A remote agent first sends the image to the server with create_upload.",
     )
     def upload_icon(
         file_path: str,

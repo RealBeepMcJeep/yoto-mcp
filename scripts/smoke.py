@@ -15,6 +15,9 @@ from mcp.client.streamable_http import streamable_http_client
 
 AUTH_FAILURES = {401, 403}
 
+# 1x1 PNG for the icon-image upload path.
+TINY_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+
 # 0.5 s, 8 kHz mono sine; the image's ffprobe must accept it as an MP3 upload.
 TINY_MP3 = base64.b64decode(
     "/+MYxAAK8AbVuUEAAv9HcNtgBg+D4PvUCAIHIPg+fxOD4PoggcRB8H34IOu/wxwG/SGOXfznT7ulJoc4WcQ3/GVEJRyhC3+D/+MYxA8QmUKQAZRQ"
@@ -79,12 +82,12 @@ async def smoke(url: str, token: str) -> None:
             raise RuntimeError("authenticated MCP tools/list returned no tools")
         version = initialized.protocol_version
         tool_count = len(tools.tools)
-        if "create_mp3_upload" not in {tool.name for tool in tools.tools}:
-            raise RuntimeError("HTTP deployment lacks create_mp3_upload (is YOTO_UPLOAD_ROOT set?)")
-        link = await session.call_tool("create_mp3_upload", {"filename": "smoke.mp3"})
-        if link.is_error:
-            raise RuntimeError("create_mp3_upload returned an error")
-        upload_url = link.structured_content["upload_url"]
+        if not {"create_upload", "create_mp3_upload"} <= {tool.name for tool in tools.tools}:
+            raise RuntimeError("HTTP deployment lacks create_upload (is YOTO_UPLOAD_ROOT set?)")
+        links = [await session.call_tool("create_upload", {"filename": name}) for name in ("smoke.mp3", "smoke.png")]
+        if any(link.is_error for link in links):
+            raise RuntimeError("create_upload returned an error")
+        upload_url, image_url = (link.structured_content["upload_url"] for link in links)
 
     async with httpx.AsyncClient(timeout=30.0) as anonymous:
         uploaded = await anonymous.put(upload_url, content=TINY_MP3)
@@ -93,11 +96,14 @@ async def smoke(url: str, token: str) -> None:
         replay = await anonymous.put(upload_url, content=TINY_MP3)
         if replay.status_code != 404:
             raise RuntimeError(f"Reused upload link returned HTTP {replay.status_code}, expected 404")
+        image = await anonymous.put(image_url, content=TINY_PNG)
+        if image.status_code != 201 or image.json().get("kind") != "image":
+            raise RuntimeError(f"Image upload link returned HTTP {image.status_code}")
 
     print(
         "Smoke passed: unauthenticated healthz, missing/wrong bearer rejection, "
         f"authenticated MCP initialize + tools/list ({tool_count} tools, protocol {version}), "
-        "single-use MP3 upload link."
+        "single-use MP3 and image upload links."
     )
 
 
